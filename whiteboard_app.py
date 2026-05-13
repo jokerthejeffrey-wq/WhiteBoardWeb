@@ -789,7 +789,7 @@ body.draw-mode #drawCanvas{display:block}
 {% if not user %}
 <div class="blur-lock">
     <div class="login-box">
-        <div class="login-head"></div>
+        <div class="login-head">your name..</div>
         <div class="tabs">
             <button class="primary" onclick="showAuth('register')">Create</button>
             <button onclick="showAuth('login')">Login</button>
