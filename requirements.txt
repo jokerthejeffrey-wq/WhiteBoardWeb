@@ -2,4 +2,3 @@ Flask
 Werkzeug
 requests
 gunicorn
-app
