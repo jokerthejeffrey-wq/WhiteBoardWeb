@@ -1,4 +1,3 @@
-# RENDER FIXED FULL APP.PY - use Start Command: gunicorn app:app
 import os
 import re
 import json
