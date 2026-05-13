@@ -579,15 +579,15 @@ button,input,textarea{font:inherit}
 #world{position:absolute;left:0;top:0;transform-origin:0 0}
 .item{position:absolute;user-select:none;touch-action:none}
 .item.editable{cursor:move}
-.text-item{background:transparent;white-space:pre-wrap;overflow:hidden;padding:4px 8px;line-height:1.05;border:0;box-shadow:none;font-weight:400}
-.image-item img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
-.audio-item{background:#fff;padding:8px}
+.text-item{background:transparent;white-space:pre-wrap;overflow:hidden;padding:34px 8px 4px 8px;line-height:1.05;border:0;box-shadow:none;font-weight:400}
+.image-item{overflow:visible!important}.image-item img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
+.audio-item{background:#fff;padding:34px 8px 8px 8px;overflow:visible!important}
 .audio-item audio{width:100%}
-.draw-item svg{width:100%;height:100%;display:block;overflow:visible}
+.draw-item{overflow:visible!important}.draw-item svg{width:100%;height:100%;display:block;overflow:visible}
 .tag{position:absolute;right:3px;bottom:2px;font-size:10px;color:#aaa;background:rgba(255,255,255,.65);padding:1px 4px}
-.toolbar{position:absolute;left:0;top:-34px;display:none;gap:4px;z-index:10}
-.item.editable:hover .toolbar{display:flex}
-.toolbar button{border:0;background:#111;color:#fff;font-size:11px;padding:6px 7px}
+.toolbar{position:absolute;left:6px;top:6px;display:none;gap:4px;z-index:99999;background:rgba(255,255,255,.86);padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.10)}
+.item.editable:hover .toolbar,.toolbar:hover{display:flex}
+.toolbar button{border:0;background:#111;color:#fff;font-size:11px;padding:6px 7px;cursor:pointer}
 #drawCanvas{position:absolute;left:0;top:0;width:4000px;height:4000px;display:none;z-index:9998;cursor:crosshair}
 body.draw-mode #drawCanvas{display:block}
 #tools{position:fixed;z-index:100;left:14px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px}
