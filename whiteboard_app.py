@@ -677,6 +677,9 @@ body.draw-on #drawCanvas{display:block}
     .tool{width:42px;height:42px;border-radius:14px}
     #palette{left:60px}
 }
+
+#NO_ROUND_FORCE{}
+*,button,input,.item,.itemBar,#tools,#settings,#auth,.authBox,.btn,.btn2{border-radius:0!important;box-shadow:none!important}
 </style>
 </head>
 <body>
