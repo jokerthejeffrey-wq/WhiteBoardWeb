@@ -45,8 +45,8 @@ MAX_TOTAL_ITEMS = int(os.environ.get("MAX_TOTAL_ITEMS", "400"))
 MAX_ITEMS_PER_USER = int(os.environ.get("MAX_ITEMS_PER_USER", "100"))
 MAX_DRAW_POINTS = int(os.environ.get("MAX_DRAW_POINTS", "300"))
 MAX_TEXT_CHARS = int(os.environ.get("MAX_TEXT_CHARS", "300"))
-MAX_TEXT_W = int(os.environ.get("MAX_TEXT_W", "420"))
-MAX_TEXT_H = int(os.environ.get("MAX_TEXT_H", "260"))
+MAX_TEXT_W = int(os.environ.get("MAX_TEXT_W", "700"))
+MAX_TEXT_H = int(os.environ.get("MAX_TEXT_H", "300"))
 
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
 FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
@@ -534,7 +534,7 @@ def public_item(item, user=None):
         "text": item.get("text", ""),
         "color": item.get("color", "#111111"),
         "bg": item.get("bg", "#ffffff"),
-        "font": clamp_int(item.get("font"), 10, 36, 18),
+        "font": clamp_int(item.get("font"), 10, 72, 18),
         "stroke": item.get("stroke", "#111111"),
         "stroke_width": int(item.get("stroke_width", 4)),
         "points": item.get("points", []),
@@ -579,7 +579,7 @@ button,input,textarea{font:inherit}
 #world{position:absolute;left:0;top:0;transform-origin:0 0}
 .item{position:absolute;user-select:none;touch-action:none}
 .item.editable{cursor:move}
-.text-item{background:#fff;white-space:pre-wrap;overflow:hidden;padding:10px 12px;line-height:1.22;border:0}
+.text-item{background:transparent;white-space:pre-wrap;overflow:hidden;padding:4px 8px;line-height:1.05;border:0;box-shadow:none;font-weight:400}
 .image-item img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
 .audio-item{background:#fff;padding:8px}
 .audio-item audio{width:100%}
@@ -599,11 +599,13 @@ label{display:block;font-size:11px;font-weight:800;color:#777;margin:8px 0 5px}
 input,textarea{width:100%;border:0;background:rgba(240,240,240,.75);outline:0;padding:9px}
 textarea{min-height:90px;resize:vertical}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:7px}
-.draft-text{position:absolute;width:260px;height:120px;background:#fff;border:2px dotted #111;outline:0;padding:10px 12px;line-height:1.2;font-size:18px;z-index:9997;resize:none;overflow:auto;white-space:pre-wrap;box-shadow:none}
-.draft-text:empty:before{content:"type...";color:#aaa}
-.draft-dot{position:absolute;width:9px;height:9px;background:#111;border:2px solid #fff;border-radius:50%;z-index:9999}
-.draft-dot.tl{left:-6px;top:-6px}.draft-dot.tr{right:-6px;top:-6px}.draft-dot.bl{left:-6px;bottom:-6px}.draft-dot.br{right:-6px;bottom:-6px;cursor:nwse-resize}
-.draft-done{position:absolute;right:-1px;top:-31px;border:0;background:#111;color:white;font-weight:900;padding:6px 9px;z-index:9999}
+.draft-wrap{position:absolute;width:360px;height:130px;background:transparent;border:2px dashed #111;z-index:9997;box-shadow:none;overflow:visible}
+.draft-input{position:absolute;inset:0;width:100%;height:100%;border:0!important;background:transparent!important;outline:0;resize:none;overflow:hidden;padding:10px 14px;line-height:1.05;font-size:58px;font-weight:400;color:#d5535d;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif}
+.draft-input::placeholder{color:rgba(213,83,93,.45)}
+.draft-handle{position:absolute;width:11px;height:11px;background:#fff;border:2px solid #111;z-index:9999}
+.draft-handle.tl{left:-7px;top:-7px;cursor:nwse-resize}.draft-handle.tm{left:50%;top:-7px;transform:translateX(-50%);cursor:ns-resize}.draft-handle.tr{right:-7px;top:-7px;cursor:nesw-resize}
+.draft-handle.ml{left:-7px;top:50%;transform:translateY(-50%);cursor:ew-resize}.draft-handle.mr{right:-7px;top:50%;transform:translateY(-50%);cursor:ew-resize}
+.draft-handle.bl{left:-7px;bottom:-7px;cursor:nesw-resize}.draft-handle.bm{left:50%;bottom:-7px;transform:translateX(-50%);cursor:ns-resize}.draft-handle.br{right:-7px;bottom:-7px;cursor:nwse-resize}
 .color-dot{width:24px;height:24px;border-radius:50%;border:2px solid rgba(0,0,0,.14);box-shadow:0 4px 14px rgba(0,0,0,.08);cursor:pointer}
 .color-dot.active{outline:3px solid #111;outline-offset:2px}
 .btn{border:0;background:#111;color:white;padding:10px 12px;font-weight:800;margin-top:8px}
@@ -792,6 +794,7 @@ async function uploadPickedFile(kind){
 }
 
 let draftBox = null;
+let draftInput = null;
 let draftSaveLock = false;
 
 function createTextBox(){
@@ -800,44 +803,36 @@ function createTextBox(){
     if(draftBox) return;
 
     const p = centerWorld();
+
     const box = document.createElement("div");
-    box.className = "draft-text";
-    box.contentEditable = "true";
+    box.className = "draft-wrap";
     box.style.left = p.x + "px";
     box.style.top = p.y + "px";
-    box.style.width = "260px";
-    box.style.height = "120px";
+    box.style.width = "360px";
+    box.style.height = "130px";
 
-    const done = document.createElement("button");
-    done.className = "draft-done";
-    done.textContent = "✓";
-    done.contentEditable = "false";
-    done.onclick = e => { e.stopPropagation(); saveDraftText(); };
+    const input = document.createElement("textarea");
+    input.className = "draft-input";
+    input.placeholder = "text box";
+    input.maxLength = 300;
+    input.spellcheck = false;
 
-    ["tl","tr","bl","br"].forEach(pos=>{
-        const d = document.createElement("span");
-        d.className = "draft-dot " + pos;
-        d.contentEditable = "false";
-        if(pos === "br"){
-            d.addEventListener("mousedown", startDraftResize);
-        }
-        box.appendChild(d);
+    box.appendChild(input);
+
+    ["tl","tm","tr","ml","mr","bl","bm","br"].forEach(pos=>{
+        const h = document.createElement("span");
+        h.className = "draft-handle " + pos;
+        h.dataset.handle = pos;
+        h.addEventListener("mousedown", startDraftResize);
+        box.appendChild(h);
     });
 
-    box.appendChild(done);
     world.appendChild(box);
     draftBox = box;
-    box.focus();
+    draftInput = input;
+    input.focus();
 
-    box.addEventListener("input", ()=>{
-        let txt = box.innerText.replace("✓", "").trim();
-        if(txt.length > 300){
-            box.innerText = txt.slice(0,300);
-            placeCaretEnd(box);
-        }
-    });
-
-    box.addEventListener("keydown", e=>{
+    input.addEventListener("keydown", e=>{
         if(e.key === "Enter" && (e.ctrlKey || e.metaKey)){
             e.preventDefault();
             saveDraftText();
@@ -849,41 +844,40 @@ function createTextBox(){
     });
 }
 
-function placeCaretEnd(el){
-    const range = document.createRange();
-    const sel = window.getSelection();
-    range.selectNodeContents(el);
-    range.collapse(false);
-    sel.removeAllRanges();
-    sel.addRange(range);
+function cancelDraftText(){
+    if(draftBox){
+        draftBox.remove();
+        draftBox = null;
+        draftInput = null;
+    }
 }
 
 function draftCleanText(){
-    if(!draftBox) return "";
-    let copy = draftBox.cloneNode(true);
-    copy.querySelectorAll(".draft-dot,.draft-done").forEach(x=>x.remove());
-    return copy.innerText.trim().slice(0,300);
-}
-
-function cancelDraftText(){
-    if(draftBox){ draftBox.remove(); draftBox = null; }
+    if(!draftInput) return "";
+    return draftInput.value.trim().slice(0,300);
 }
 
 async function saveDraftText(){
-    if(!draftBox || draftSaveLock) return;
+    if(!draftBox || !draftInput || draftSaveLock) return;
+
     const txt = draftCleanText();
-    if(!txt){ cancelDraftText(); return; }
+    if(!txt){
+        cancelDraftText();
+        return;
+    }
 
     draftSaveLock = true;
+
     const data = {
         text: txt,
         x: parseInt(draftBox.style.left || "0"),
         y: parseInt(draftBox.style.top || "0"),
-        w: Math.max(80, Math.min(420, Math.round(draftBox.offsetWidth))),
-        h: Math.max(50, Math.min(260, Math.round(draftBox.offsetHeight)))
+        w: Math.max(120, Math.min(700, Math.round(draftBox.offsetWidth))),
+        h: Math.max(70, Math.min(300, Math.round(draftBox.offsetHeight)))
     };
 
     const out = await postJson("/api/add-text-box", data);
+
     if(out && out.ok){
         cancelDraftText();
 
@@ -900,36 +894,73 @@ async function saveDraftText(){
         lastLoadKey = "";
         setTimeout(loadViewport, 250);
     }
+
     draftSaveLock = false;
 }
 
 let draftResize = null;
+
 function startDraftResize(e){
     if(!draftBox) return;
+
     e.preventDefault();
     e.stopPropagation();
+
     draftResize = {
-        x:e.clientX,
-        y:e.clientY,
-        w:draftBox.offsetWidth,
-        h:draftBox.offsetHeight
+        handle: e.target.dataset.handle || "br",
+        x: e.clientX,
+        y: e.clientY,
+        left: parseInt(draftBox.style.left || "0"),
+        top: parseInt(draftBox.style.top || "0"),
+        w: draftBox.offsetWidth,
+        h: draftBox.offsetHeight
     };
 }
+
 document.addEventListener("mousemove", e=>{
     if(!draftResize || !draftBox) return;
-    const w = Math.max(80, Math.min(420, draftResize.w + (e.clientX - draftResize.x)));
-    const h = Math.max(50, Math.min(260, draftResize.h + (e.clientY - draftResize.y)));
+
+    let dx = e.clientX - draftResize.x;
+    let dy = e.clientY - draftResize.y;
+
+    let left = draftResize.left;
+    let top = draftResize.top;
+    let w = draftResize.w;
+    let h = draftResize.h;
+
+    const handle = draftResize.handle;
+
+    if(handle.includes("r")) w = draftResize.w + dx;
+    if(handle.includes("l")){
+        w = draftResize.w - dx;
+        left = draftResize.left + dx;
+    }
+
+    if(handle.includes("b")) h = draftResize.h + dy;
+    if(handle.includes("t")){
+        h = draftResize.h - dy;
+        top = draftResize.top + dy;
+    }
+
+    w = Math.max(120, Math.min(700, w));
+    h = Math.max(70, Math.min(300, h));
+
+    draftBox.style.left = left + "px";
+    draftBox.style.top = top + "px";
     draftBox.style.width = w + "px";
     draftBox.style.height = h + "px";
 });
+
 document.addEventListener("mouseup", ()=>{
     draftResize = null;
 });
+
 document.addEventListener("mousedown", e=>{
     if(draftBox && !draftBox.contains(e.target) && !e.target.closest("#tools")){
         saveDraftText();
     }
 }, true);
+
 function applyCamera(){
     world.style.transform = `translate(${camera.x}px, ${camera.y}px)`;
     viewport.style.backgroundPosition = `${camera.x}px ${camera.y}px`;
@@ -989,7 +1020,8 @@ function itemHtml(item){
     }
 
     if(item.type === "text"){
-        style += `background:${item.bg};color:${item.color};font-size:${item.font}px;`;
+        const bg = item.bg || "transparent";
+        style += `background:${bg};color:${item.color};font-size:${item.font}px;`;
         html = `<div id="item-${item.id}" class="item text-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<div data-text-body></div><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }else if(item.type === "image"){
         html = `<div id="item-${item.id}" class="item image-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<img src="${item.file_url}?v=${item.created || Date.now()}" onload="this.dataset.ok='1'" onerror="this.style.display='none'; this.parentElement.insertAdjacentHTML('beforeend', '<div style=&quot;font-size:12px;color:#999;padding:8px&quot;>image loading failed</div>')"><div class="tag">@${escapeHtml(item.username)}</div></div>`;
@@ -1424,9 +1456,9 @@ def api_add_text_box():
         "h": h,
         "z": int(time.time()) % 9000 + 1,
         "text": text,
-        "color": "#111111",
-        "bg": "#ffffff",
-        "font": 18,
+        "color": "#d5535d",
+        "bg": "transparent",
+        "font": 58,
         "created": int(time.time()),
         "updated": int(time.time()),
     }
