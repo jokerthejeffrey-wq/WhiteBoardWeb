@@ -50,8 +50,8 @@ MAX_TEXT_H = int(os.environ.get("MAX_TEXT_H", "300"))
 
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
 FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
-DB_SNAPSHOT_KEEP = max(1, int(os.environ.get("DB_SNAPSHOT_KEEP", "2")))
-DB_SNAPSHOT_DELETE_LIMIT = max(1, int(os.environ.get("DB_SNAPSHOT_DELETE_LIMIT", "20")))
+DB_SNAPSHOT_KEEP = max(1, int(os.environ.get("DB_SNAPSHOT_KEEP", "1")))
+DB_SNAPSHOT_DELETE_LIMIT = max(1, int(os.environ.get("DB_SNAPSHOT_DELETE_LIMIT", "200")))
 AUTO_DELETE_OLD_SNAPSHOTS = os.environ.get("AUTO_DELETE_OLD_SNAPSHOTS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 NAME_CHANGE_COOLDOWN_SECONDS = int(os.environ.get("NAME_CHANGE_COOLDOWN_SECONDS", str(10 * 24 * 60 * 60)))
@@ -380,32 +380,66 @@ def delete_message(message_id):
 
 
 def cleanup_old_snapshots(keep=None, delete_limit=None):
+    # Deletes only old WBDBSNAP database messages.
+    # It does NOT delete uploaded images/audio attachments.
+    # This keeps the board database storage small while preserving files.
     if keep is None:
         keep = DB_SNAPSHOT_KEEP
     if delete_limit is None:
         delete_limit = DB_SNAPSHOT_DELETE_LIMIT
 
-    try:
-        messages = fetch_messages(max_pages=20, stop_after_snapshot=False)
-    except Exception:
-        return {"ok": False, "deleted": 0, "kept": 0}
+    keep = max(1, int(keep))
+    delete_limit = max(1, int(delete_limit))
 
-    snapshots = [m for m in messages if (m.get("content", "") or "").startswith("WBDBSNAP|")]
-    snapshots.sort(key=lambda m: int(m.get("id", "0")), reverse=True)
+    total_deleted = 0
+    total_found = 0
+    total_kept = 0
 
-    to_keep = snapshots[:keep]
-    to_delete = snapshots[keep:keep + delete_limit]
+    # Run multiple passes because Discord messages are paginated.
+    # This removes old database snapshots aggressively without touching file uploads.
+    for _ in range(6):
+        try:
+            messages = fetch_messages(max_pages=20, stop_after_snapshot=False)
+        except Exception:
+            break
 
-    deleted = 0
-    for msg in to_delete:
-        if delete_message(msg.get("id", "")):
-            deleted += 1
-            time.sleep(0.25)
+        snapshots = [
+            m for m in messages
+            if (m.get("content", "") or "").startswith("WBDBSNAP|")
+        ]
 
-    if deleted:
+        snapshots.sort(key=lambda m: int(m.get("id", "0")), reverse=True)
+
+        total_found = max(total_found, len(snapshots))
+        total_kept = keep
+
+        to_delete = snapshots[keep:keep + delete_limit]
+
+        if not to_delete:
+            break
+
+        deleted_this_pass = 0
+
+        for msg in to_delete:
+            if delete_message(msg.get("id", "")):
+                deleted_this_pass += 1
+                total_deleted += 1
+                time.sleep(0.22)
+
+        if deleted_this_pass == 0:
+            break
+
         clear_cache()
 
-    return {"ok": True, "deleted": deleted, "kept": len(to_keep), "total": len(snapshots)}
+        if len(to_delete) < delete_limit:
+            break
+
+    return {
+        "ok": True,
+        "deleted": total_deleted,
+        "kept": total_kept,
+        "total": total_found,
+    }
 
 
 def load_store(force=False):
@@ -460,7 +494,9 @@ def save_db(db):
     )
 
     if AUTO_DELETE_OLD_SNAPSHOTS:
-        cleanup_old_snapshots()
+        # After every board update, keep only the newest DB snapshot.
+        # This deletes old database saves, not uploaded files.
+        cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=DB_SNAPSHOT_DELETE_LIMIT)
 
     clear_cache()
 
@@ -573,7 +609,7 @@ HTML = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{box-sizing:border-box}
-html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif;touch-action:none}
 button,input,textarea{font:inherit}
 #viewport{position:fixed;inset:0;overflow:hidden;background-color:#fff;background-image:linear-gradient(rgba(0,0,0,.055) 1px, transparent 1px),linear-gradient(90deg, rgba(0,0,0,.055) 1px, transparent 1px);background-size:42px 42px;cursor:default}
 #world{position:absolute;left:0;top:0;transform-origin:0 0}
@@ -588,20 +624,20 @@ button,input,textarea{font:inherit}
 .toolbar{position:absolute;left:6px;top:6px;display:none;gap:4px;z-index:99999;background:rgba(255,255,255,.86);padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.10)}
 .item.editable:hover .toolbar,.toolbar:hover{display:flex}
 .toolbar button{border:0;background:#111;color:#fff;font-size:11px;padding:6px 7px;cursor:pointer}
-#drawCanvas{position:absolute;left:0;top:0;width:4000px;height:4000px;display:none;z-index:9998;cursor:crosshair}
+#drawCanvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:none;z-index:9998;cursor:crosshair}
 body.draw-mode #drawCanvas{display:block}
-#tools{position:fixed;z-index:100;left:14px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px}
+#tools{position:fixed;z-index:10050;left:14px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px}
 .tool{width:44px;height:44px;border:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.08);font-weight:900;font-size:16px}
 .tool.active{background:#111;color:#fff}
-.panel{position:fixed;z-index:99;left:66px;top:50%;transform:translateY(-50%);width:auto;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:8px;display:none}
+.panel{position:fixed;z-index:10040;left:66px;top:50%;transform:translateY(-50%);width:auto;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:8px;display:none}
 .panel.show{display:flex;gap:8px;align-items:center}
 label{display:block;font-size:11px;font-weight:800;color:#777;margin:8px 0 5px}
 input,textarea{width:100%;border:0;background:rgba(240,240,240,.75);outline:0;padding:9px}
 textarea{min-height:90px;resize:vertical}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:7px}
 .draft-wrap{position:absolute;width:360px;height:130px;background:transparent;border:2px dashed #111;z-index:9997;box-shadow:none;overflow:visible}
-.draft-input{position:absolute;inset:0;width:100%;height:100%;border:0!important;background:transparent!important;outline:0;resize:none;overflow:hidden;padding:10px 14px;line-height:1.05;font-size:58px;font-weight:400;color:#d5535d;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif}
-.draft-input::placeholder{color:rgba(213,83,93,.45)}
+.draft-input{position:absolute;inset:0;width:100%;height:100%;border:0!important;background:transparent!important;outline:0;resize:none;overflow:hidden;padding:10px 14px;line-height:1.05;font-size:58px;font-weight:400;color:#111111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif}
+.draft-input::placeholder{color:rgba(0,0,0,.25)}
 .draft-handle{position:absolute;width:11px;height:11px;background:#fff;border:2px solid #111;z-index:9999}
 .draft-handle.tl{left:-7px;top:-7px;cursor:nwse-resize}.draft-handle.tm{left:50%;top:-7px;transform:translateX(-50%);cursor:ns-resize}.draft-handle.tr{right:-7px;top:-7px;cursor:nesw-resize}
 .draft-handle.ml{left:-7px;top:50%;transform:translateY(-50%);cursor:ew-resize}.draft-handle.mr{right:-7px;top:50%;transform:translateY(-50%);cursor:ew-resize}
@@ -612,7 +648,7 @@ textarea{min-height:90px;resize:vertical}
 .btn2{border:0;background:#eee;color:#111;padding:10px 12px;font-weight:800;margin-top:8px}
 #loginOverlay{position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:flex;align-items:center;justify-content:center}
 #loginBox{width:min(390px,92vw);background:rgba(255,255,255,.82);backdrop-filter:blur(26px);box-shadow:0 30px 100px rgba(0,0,0,.14);padding:18px}
-#settingsOverlay{position:fixed;inset:0;z-index:99998;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:none;align-items:center;justify-content:center}
+#settingsOverlay{position:fixed;inset:0;z-index:10060;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:none;align-items:center;justify-content:center}
 .hidden{display:none!important}
 .msg{position:fixed;z-index:1000;top:12px;left:50%;transform:translateX(-50%);background:#111;color:white;padding:9px 12px;font-size:13px}
 </style>
@@ -628,9 +664,8 @@ textarea{min-height:90px;resize:vertical}
 {% endwith %}
 
 <div id="viewport">
-    <div id="world">
-        <canvas id="drawCanvas" width="4000" height="4000"></canvas>
-    </div>
+    <div id="world"></div>
+    <canvas id="drawCanvas"></canvas>
 </div>
 
 {% if user %}
@@ -816,6 +851,7 @@ function createTextBox(){
     input.placeholder = "text box";
     input.maxLength = 300;
     input.spellcheck = false;
+    input.style.color = selectedDrawColor || "#111111";
 
     box.appendChild(input);
 
@@ -870,6 +906,7 @@ async function saveDraftText(){
 
     const data = {
         text: txt,
+        color: selectedDrawColor || "#111111",
         x: parseInt(draftBox.style.left || "0"),
         y: parseInt(draftBox.style.top || "0"),
         w: Math.max(120, Math.min(700, Math.round(draftBox.offsetWidth))),
@@ -971,6 +1008,10 @@ function applyCamera(){
 applyCamera();
 
 function setActiveTool(name){
+    if(name !== "draw"){
+        drawMode = false;
+        document.body.classList.remove("draw-mode");
+    }
     document.querySelectorAll(".tool").forEach(x=>x.classList.remove("active"));
     const b = document.querySelector(`[data-tool="${name}"]`);
     if(b) b.classList.add("active");
@@ -987,6 +1028,49 @@ function closeSettings(){ document.getElementById("settingsOverlay").style.displ
 
 let panning=false, panStart={x:0,y:0}, camStart={x:0,y:0};
 viewport.addEventListener("contextmenu", e=>e.preventDefault());
+
+// Block browser zoom cheating: Ctrl/Cmd + wheel and Ctrl/Cmd + + - 0.
+// Normal wheel only moves the board camera, so UI/tool size stays unchanged.
+window.addEventListener("wheel", e=>{
+    if(e.ctrlKey || e.metaKey){
+        e.preventDefault();
+        return;
+    }
+
+    const typing = e.target && (
+        e.target.tagName === "TEXTAREA" ||
+        e.target.tagName === "INPUT" ||
+        e.target.isContentEditable
+    );
+
+    if(typing) return;
+
+    e.preventDefault();
+
+    camera.x -= e.deltaX;
+    camera.y -= e.deltaY;
+
+    if(e.shiftKey){
+        camera.x -= e.deltaY;
+        camera.y += e.deltaY;
+    }
+
+    applyCamera();
+}, {passive:false});
+
+window.addEventListener("keydown", e=>{
+    const key = String(e.key || "").toLowerCase();
+
+    if((e.ctrlKey || e.metaKey) && ["+","=","-","_","0"].includes(key)){
+        e.preventDefault();
+        return false;
+    }
+}, {capture:true});
+
+["gesturestart","gesturechange","gestureend"].forEach(name=>{
+    window.addEventListener(name, e=>e.preventDefault(), {passive:false});
+});
+
 viewport.addEventListener("mousedown", e=>{
     if(e.button !== 2) return;
     panning=true;
@@ -1181,6 +1265,14 @@ let selectedDrawSize = 4;
 const canvas=document.getElementById("drawCanvas");
 const ctx=canvas ? canvas.getContext("2d") : null;
 
+function resizeDrawCanvas(){
+    if(!canvas) return;
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+resizeDrawCanvas();
+window.addEventListener("resize", resizeDrawCanvas);
+
 function toggleDrawPalette(){
     setActiveTool("draw");
     const p = document.getElementById("panel-draw");
@@ -1192,12 +1284,15 @@ function selectDrawColor(color, el){
     selectedDrawColor = color;
     document.querySelectorAll(".color-dot").forEach(x=>x.classList.remove("active"));
     if(el) el.classList.add("active");
+    if(draftInput){
+        draftInput.style.color = selectedDrawColor;
+    }
     drawMode = true;
     document.body.classList.add("draw-mode");
 }
 function drawPoint(e){
     const p=screenToWorld(e.clientX,e.clientY);
-    return {x:p.x+2000,y:p.y+2000, realX:p.x, realY:p.y};
+    return {x:e.clientX, y:e.clientY, realX:p.x, realY:p.y};
 }
 if(canvas && ctx){
     canvas.addEventListener("mousedown",e=>{
@@ -1425,6 +1520,7 @@ def api_add_text_box():
     data = request.get_json(silent=True) or {}
 
     text = clean_text(data.get("text"), MAX_TEXT_CHARS)
+    color = safe_hex_color(data.get("color"), "#111111")
     x = clamp_int(data.get("x"), -10_000_000, 10_000_000, 0)
     y = clamp_int(data.get("y"), -10_000_000, 10_000_000, 0)
     w = clamp_int(data.get("w"), 80, MAX_TEXT_W, 260)
@@ -1456,7 +1552,7 @@ def api_add_text_box():
         "h": h,
         "z": int(time.time()) % 9000 + 1,
         "text": text,
-        "color": "#d5535d",
+        "color": color,
         "bg": "transparent",
         "font": 58,
         "created": int(time.time()),
@@ -1934,7 +2030,7 @@ def api_debug_item(item_id):
 def cleanup_route():
     if not current_is_staff():
         return "no", 403
-    result = cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=100)
+    result = cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=DB_SNAPSHOT_DELETE_LIMIT)
     return f"deleted {result.get('deleted', 0)}"
 
 
