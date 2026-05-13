@@ -23,7 +23,7 @@ from functools import wraps
 import requests
 from flask import (
     Flask, request, redirect, url_for, session, flash,
-    render_template_string, jsonify, abort
+    render_template_string, jsonify, abort, Response
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -197,6 +197,24 @@ def allowed_image(filename):
 
 def allowed_audio(filename):
     return Path((filename or "").lower()).suffix in ALLOWED_AUDIO_EXTENSIONS
+
+
+def guess_content_type(filename, fallback="application/octet-stream"):
+    ext = Path((filename or "").lower()).suffix
+
+    mapping = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".m4a": "audio/mp4",
+    }
+
+    return mapping.get(ext, fallback)
 
 
 def blank_db():
@@ -924,7 +942,7 @@ function itemHtml(item){
         style += `background:${item.bg};color:${item.color};font-size:${item.font}px;`;
         html = `<div id="item-${item.id}" class="item text-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<div data-text-body></div><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }else if(item.type === "image"){
-        html = `<div id="item-${item.id}" class="item image-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<img src="${item.file_url}"><div class="tag">@${escapeHtml(item.username)}</div></div>`;
+        html = `<div id="item-${item.id}" class="item image-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<img src="${item.file_url}" onerror="this.style.display=\'none\'; this.parentElement.insertAdjacentHTML(\'beforeend\', \'<div style=&quot;font-size:12px;color:#999;padding:8px&quot;>image loading failed</div>\')"><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }else if(item.type === "audio"){
         html = `<div id="item-${item.id}" class="item audio-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<audio controls preload="none" src="${item.file_url}"></audio><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }else{
@@ -1507,20 +1525,90 @@ def board_file(item_id):
     if not item or item.get("type") not in {"image", "audio"}:
         abort(404)
 
+    # Support both the new field names and older DB snapshots from previous versions.
+    message_id = (
+        item.get("file_message_id")
+        or item.get("image_message_id")
+        or item.get("audio_message_id")
+        or ""
+    )
+
+    stored_url = (
+        item.get("file_url")
+        or item.get("image_url")
+        or item.get("audio_url")
+        or ""
+    )
+
+    stored_proxy_url = (
+        item.get("file_proxy_url")
+        or item.get("image_proxy_url")
+        or item.get("audio_proxy_url")
+        or ""
+    )
+
     info = None
-    if item.get("file_message_id"):
-        info = attachment_info_from_message(item.get("file_message_id"))
+    if message_id:
+        info = attachment_info_from_message(message_id)
 
     url = ""
+    content_type = ""
+
     if info:
-        url = info.get("url") or info.get("proxy_url")
+        url = info.get("url") or info.get("proxy_url") or ""
+        content_type = info.get("content_type") or ""
+
     if not url:
-        url = item.get("file_url") or item.get("file_proxy_url")
+        url = stored_url or stored_proxy_url
+
+    if not content_type:
+        content_type = guess_content_type(item.get("filename", ""))
 
     if not url:
         abort(404)
 
-    return redirect(url)
+    # Proxy the file through this app instead of redirecting.
+    # This fixes cases where Discord's attachment URL/proxy URL does not render directly
+    # inside the whiteboard image/audio tag.
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+
+        final_type = r.headers.get("Content-Type") or content_type or guess_content_type(item.get("filename", ""))
+
+        return Response(
+            r.content,
+            mimetype=final_type,
+            headers={
+                "Cache-Control": "public, max-age=600",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception:
+        # Last fallback: try Discord proxy URL if the normal URL failed.
+        fallback = ""
+        if info:
+            fallback = info.get("proxy_url") or ""
+
+        if fallback and fallback != url:
+            try:
+                r = requests.get(fallback, timeout=60)
+                r.raise_for_status()
+
+                final_type = r.headers.get("Content-Type") or content_type or guess_content_type(item.get("filename", ""))
+
+                return Response(
+                    r.content,
+                    mimetype=final_type,
+                    headers={
+                        "Cache-Control": "public, max-age=600",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+            except Exception:
+                pass
+
+        abort(404)
 
 
 def get_item_for_edit(item_id):
@@ -1680,6 +1768,40 @@ def api_add_drawing():
         return jsonify({"ok": False, "error": str(e)}), 500
 
     return jsonify({"ok": True})
+
+
+
+@app.route("/api/debug-item/<item_id>")
+@login_required
+def api_debug_item(item_id):
+    if not current_is_staff():
+        return jsonify({"ok": False, "error": "no"}), 403
+
+    try:
+        db = load_store(force=True)["db"]
+        item = db.get("items", {}).get(item_id)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    if not item:
+        return jsonify({"ok": False, "error": "not found"}), 404
+
+    return jsonify({
+        "ok": True,
+        "item": {
+            "id": item.get("id"),
+            "type": item.get("type"),
+            "filename": item.get("filename"),
+            "file_message_id": item.get("file_message_id"),
+            "image_message_id": item.get("image_message_id"),
+            "file_url_exists": bool(item.get("file_url")),
+            "image_url_exists": bool(item.get("image_url")),
+            "x": item.get("x"),
+            "y": item.get("y"),
+            "w": item.get("w"),
+            "h": item.get("h"),
+        }
+    })
 
 
 @app.route("/cleanup")
