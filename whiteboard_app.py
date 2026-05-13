@@ -1,3 +1,13 @@
+# app.py
+# Render Start Command:
+# gunicorn app:app
+#
+# requirements.txt:
+# Flask
+# Werkzeug
+# requests
+# gunicorn
+
 import os
 import re
 import json
@@ -43,7 +53,7 @@ CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
 FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
 DB_SNAPSHOT_KEEP = max(1, int(os.environ.get("DB_SNAPSHOT_KEEP", "1")))
 DB_SNAPSHOT_DELETE_LIMIT = max(1, int(os.environ.get("DB_SNAPSHOT_DELETE_LIMIT", "25")))
-AUTO_DELETE_OLD_SNAPSHOTS = os.environ.get("AUTO_DELETE_OLD_SNAPSHOTS", "1").strip().lower() not in {"0", "false", "no", "off"}
+AUTO_DELETE_OLD_SNAPSHOTS = os.environ.get("AUTO_DELETE_OLD_SNAPSHOTS", "0").strip().lower() not in {"0", "false", "no", "off"}
 
 NAME_CHANGE_COOLDOWN_SECONDS = int(os.environ.get("NAME_CHANGE_COOLDOWN_SECONDS", str(10 * 24 * 60 * 60)))
 
@@ -418,7 +428,7 @@ def cleanup_old_snapshots(keep=None, delete_limit=None, max_pages=6):
 
 
 def cleanup_old_snapshots_background():
-    # Runs after saves in the background, so uploading/moving/deleting does not freeze the site.
+    # Manual/light cleanup only. Do not call this after every save.
     def worker():
         if not CLEANUP_LOCK.acquire(blocking=False):
             return
@@ -439,6 +449,25 @@ def cleanup_old_snapshots_background():
         pass
 
 
+def delete_message_background(message_id):
+    # Delete exactly one old DB snapshot in the background.
+    # This prevents freezing caused by scanning/deleting many Discord messages.
+    if not message_id:
+        return
+
+    def worker():
+        try:
+            delete_message(message_id)
+        except Exception:
+            pass
+
+    try:
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+    except Exception:
+        pass
+
+
 def load_store(force=False):
     now = time.time()
     if not force and CACHE["store"] is not None and now - CACHE["time"] < CACHE_SECONDS:
@@ -448,6 +477,7 @@ def load_store(force=False):
 
     db = blank_db()
     snapshot_loaded = False
+    latest_snapshot_id = ""
 
     for msg in messages:
         content = msg.get("content", "") or ""
@@ -455,6 +485,7 @@ def load_store(force=False):
 
         if content.startswith("WBDBSNAP|") and attachments:
             try:
+                latest_snapshot_id = msg.get("id", "")
                 url = attachments[0].get("url", "")
                 r = requests.get(url, timeout=60)
                 r.raise_for_status()
@@ -465,9 +496,15 @@ def load_store(force=False):
                 snapshot_loaded = True
                 break
             except Exception:
+                latest_snapshot_id = ""
                 continue
 
-    store = {"db": normalize_db(db), "snapshot_loaded": snapshot_loaded, "message_count": len(messages)}
+    store = {
+        "db": normalize_db(db),
+        "snapshot_loaded": snapshot_loaded,
+        "message_count": len(messages),
+        "latest_snapshot_id": latest_snapshot_id,
+    }
     CACHE["time"] = now
     CACHE["store"] = store
     return store
@@ -490,12 +527,10 @@ def save_db(db):
         content_type="application/gzip",
     )
 
+    # Old stable behavior: just save and refresh cache.
+    # No auto scanning/deleting old DB messages during user actions.
+    # This prevents Render from freezing.
     clear_cache()
-
-    if AUTO_DELETE_OLD_SNAPSHOTS:
-        # Clean old database snapshots in background.
-        # This keeps only the newest DB snapshot without freezing uploads/moves/deletes.
-        cleanup_old_snapshots_background()
 
 
 def cache_attachment(kind, key, info):
@@ -606,9 +641,10 @@ HTML = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{box-sizing:border-box}
+:root{--ui-scale:1;--grid-size:42px}
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif;touch-action:none}
 button,input,textarea{font:inherit}
-#viewport{position:fixed;inset:0;overflow:hidden;background-color:#fff;background-image:linear-gradient(rgba(0,0,0,.055) 1px, transparent 1px),linear-gradient(90deg, rgba(0,0,0,.055) 1px, transparent 1px);background-size:42px 42px;cursor:default}
+#viewport{position:fixed;inset:0;overflow:hidden;background-color:#fff;background-image:linear-gradient(rgba(0,0,0,.055) 1px, transparent 1px),linear-gradient(90deg, rgba(0,0,0,.055) 1px, transparent 1px);background-size:var(--grid-size) var(--grid-size);cursor:default}
 #world{position:absolute;left:0;top:0;transform-origin:0 0}
 .item{position:absolute;user-select:none;touch-action:none}
 .item.editable{cursor:move}
@@ -621,12 +657,12 @@ button,input,textarea{font:inherit}
 .toolbar{position:absolute;left:6px;top:6px;display:none;gap:4px;z-index:99999;background:rgba(255,255,255,.86);padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.10)}
 .item.editable:hover .toolbar,.toolbar:hover{display:flex}
 .toolbar button{border:0;background:#111;color:#fff;font-size:11px;padding:6px 7px;cursor:pointer}
-#drawCanvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:none;z-index:9998;cursor:crosshair}
-body.draw-mode #drawCanvas{display:block}
-#tools{position:fixed;z-index:10050;left:14px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px}
+#drawCanvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:none;z-index:9998;cursor:crosshair;pointer-events:none}
+body.draw-mode #drawCanvas{display:block;pointer-events:auto}
+#tools{position:fixed;z-index:10050;left:14px;top:50%;transform:translateY(-50%) scale(var(--ui-scale));transform-origin:left center;display:flex;flex-direction:column;gap:8px}
 .tool{width:44px;height:44px;border:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.08);font-weight:900;font-size:16px}
 .tool.active{background:#111;color:#fff}
-.panel{position:fixed;z-index:10040;left:66px;top:50%;transform:translateY(-50%);width:auto;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:8px;display:none}
+.panel{position:fixed;z-index:10040;left:66px;top:50%;transform:translateY(-50%) scale(var(--ui-scale));transform-origin:left center;width:auto;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:8px;display:none}
 .panel.show{display:flex;gap:8px;align-items:center}
 label{display:block;font-size:11px;font-weight:800;color:#777;margin:8px 0 5px}
 input,textarea{width:100%;border:0;background:rgba(240,240,240,.75);outline:0;padding:9px}
@@ -739,6 +775,25 @@ let loading = false;
 let lastLoadKey = "";
 const viewport = document.getElementById("viewport");
 const world = document.getElementById("world");
+
+function updateZoomCompensation(){
+    // If browser zoom is accidentally set very high, keep tools/grid usable.
+    // This cannot change the browser's real zoom UI, but it normalizes the app UI.
+    let ratio = 1;
+    try{
+        if(window.outerWidth && window.innerWidth){
+            ratio = Math.max(1, window.outerWidth / window.innerWidth);
+        }
+    }catch(e){ ratio = 1; }
+
+    const scale = Math.max(0.20, Math.min(1, 1 / ratio));
+    const grid = Math.max(8, Math.round(42 * scale));
+
+    document.documentElement.style.setProperty("--ui-scale", String(scale));
+    document.documentElement.style.setProperty("--grid-size", grid + "px");
+}
+updateZoomCompensation();
+window.addEventListener("resize", updateZoomCompensation);
 
 function screenToWorld(sx, sy){
     return {x: Math.round(sx - camera.x), y: Math.round(sy - camera.y)};
