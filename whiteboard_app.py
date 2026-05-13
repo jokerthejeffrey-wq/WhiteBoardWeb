@@ -1,13 +1,3 @@
-# app.py
-# Render Start Command:
-# gunicorn app:app
-#
-# requirements.txt:
-# Flask
-# Werkzeug
-# requests
-# gunicorn
-
 import os
 import re
 import json
@@ -16,6 +6,7 @@ import time
 import html
 import secrets
 import hashlib
+import threading
 from io import BytesIO
 from pathlib import Path
 from functools import wraps
@@ -51,7 +42,7 @@ MAX_TEXT_H = int(os.environ.get("MAX_TEXT_H", "300"))
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
 FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
 DB_SNAPSHOT_KEEP = max(1, int(os.environ.get("DB_SNAPSHOT_KEEP", "1")))
-DB_SNAPSHOT_DELETE_LIMIT = max(1, int(os.environ.get("DB_SNAPSHOT_DELETE_LIMIT", "200")))
+DB_SNAPSHOT_DELETE_LIMIT = max(1, int(os.environ.get("DB_SNAPSHOT_DELETE_LIMIT", "25")))
 AUTO_DELETE_OLD_SNAPSHOTS = os.environ.get("AUTO_DELETE_OLD_SNAPSHOTS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 NAME_CHANGE_COOLDOWN_SECONDS = int(os.environ.get("NAME_CHANGE_COOLDOWN_SECONDS", str(10 * 24 * 60 * 60)))
@@ -66,6 +57,7 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
 
 CACHE = {"time": 0, "store": None}
 ATTACHMENT_CACHE = {"items": {}, "seconds": 20 * 60}
+CLEANUP_LOCK = threading.Lock()
 
 
 # -----------------------------
@@ -379,10 +371,10 @@ def delete_message(message_id):
         return False
 
 
-def cleanup_old_snapshots(keep=None, delete_limit=None):
+def cleanup_old_snapshots(keep=None, delete_limit=None, max_pages=6):
     # Deletes only old WBDBSNAP database messages.
     # It does NOT delete uploaded images/audio attachments.
-    # This keeps the board database storage small while preserving files.
+    # This version is intentionally bounded so the website does not freeze.
     if keep is None:
         keep = DB_SNAPSHOT_KEEP
     if delete_limit is None:
@@ -390,56 +382,61 @@ def cleanup_old_snapshots(keep=None, delete_limit=None):
 
     keep = max(1, int(keep))
     delete_limit = max(1, int(delete_limit))
+    max_pages = max(1, int(max_pages))
 
-    total_deleted = 0
-    total_found = 0
-    total_kept = 0
+    try:
+        messages = fetch_messages(max_pages=max_pages, stop_after_snapshot=False)
+    except Exception:
+        return {"ok": False, "deleted": 0, "kept": 0, "total": 0}
 
-    # Run multiple passes because Discord messages are paginated.
-    # This removes old database snapshots aggressively without touching file uploads.
-    for _ in range(6):
-        try:
-            messages = fetch_messages(max_pages=20, stop_after_snapshot=False)
-        except Exception:
-            break
+    snapshots = [
+        m for m in messages
+        if (m.get("content", "") or "").startswith("WBDBSNAP|")
+    ]
 
-        snapshots = [
-            m for m in messages
-            if (m.get("content", "") or "").startswith("WBDBSNAP|")
-        ]
+    snapshots.sort(key=lambda m: int(m.get("id", "0")), reverse=True)
 
-        snapshots.sort(key=lambda m: int(m.get("id", "0")), reverse=True)
+    to_keep = snapshots[:keep]
+    to_delete = snapshots[keep:keep + delete_limit]
 
-        total_found = max(total_found, len(snapshots))
-        total_kept = keep
+    deleted = 0
 
-        to_delete = snapshots[keep:keep + delete_limit]
+    for msg in to_delete:
+        if delete_message(msg.get("id", "")):
+            deleted += 1
+            time.sleep(0.18)
 
-        if not to_delete:
-            break
-
-        deleted_this_pass = 0
-
-        for msg in to_delete:
-            if delete_message(msg.get("id", "")):
-                deleted_this_pass += 1
-                total_deleted += 1
-                time.sleep(0.22)
-
-        if deleted_this_pass == 0:
-            break
-
+    if deleted:
         clear_cache()
-
-        if len(to_delete) < delete_limit:
-            break
 
     return {
         "ok": True,
-        "deleted": total_deleted,
-        "kept": total_kept,
-        "total": total_found,
+        "deleted": deleted,
+        "kept": len(to_keep),
+        "total": len(snapshots),
     }
+
+
+def cleanup_old_snapshots_background():
+    # Runs after saves in the background, so uploading/moving/deleting does not freeze the site.
+    def worker():
+        if not CLEANUP_LOCK.acquire(blocking=False):
+            return
+
+        try:
+            cleanup_old_snapshots(
+                keep=DB_SNAPSHOT_KEEP,
+                delete_limit=DB_SNAPSHOT_DELETE_LIMIT,
+                max_pages=6,
+            )
+        finally:
+            CLEANUP_LOCK.release()
+
+    try:
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+    except Exception:
+        pass
 
 
 def load_store(force=False):
@@ -493,12 +490,12 @@ def save_db(db):
         content_type="application/gzip",
     )
 
-    if AUTO_DELETE_OLD_SNAPSHOTS:
-        # After every board update, keep only the newest DB snapshot.
-        # This deletes old database saves, not uploaded files.
-        cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=DB_SNAPSHOT_DELETE_LIMIT)
-
     clear_cache()
+
+    if AUTO_DELETE_OLD_SNAPSHOTS:
+        # Clean old database snapshots in background.
+        # This keeps only the newest DB snapshot without freezing uploads/moves/deletes.
+        cleanup_old_snapshots_background()
 
 
 def cache_attachment(kind, key, info):
@@ -2030,7 +2027,7 @@ def api_debug_item(item_id):
 def cleanup_route():
     if not current_is_staff():
         return "no", 403
-    result = cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=DB_SNAPSHOT_DELETE_LIMIT)
+    result = cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=100, max_pages=12)
     return f"deleted {result.get('deleted', 0)}"
 
 
