@@ -7,7 +7,7 @@
 # Werkzeug
 # requests
 # gunicorn
-#
+
 import os
 import re
 import json
@@ -29,7 +29,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
 
-APP_NAME = os.environ.get("APP_NAME", "Public Whiteboard")
+APP_NAME = os.environ.get("APP_NAME", "Boardlume")
 DISCORD_API = "https://discord.com/api/v10"
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
@@ -38,14 +38,12 @@ DISCORD_DB_CHANNEL_ID = os.environ.get("DISCORD_DB_CHANNEL_ID", "").strip()
 CREATOR_EMAIL = os.environ.get("CREATOR_EMAIL", "tuna.iren@outlook.com").strip().lower()
 MOD_EMAILS = [x.strip().lower() for x in os.environ.get("MOD_EMAILS", "").split(",") if x.strip()]
 
-BOARD_W = int(os.environ.get("BOARD_W", "1600"))
-BOARD_H = int(os.environ.get("BOARD_H", "1000"))
-
 MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", str(10 * 1024 * 1024)))
 MAX_DB_SIZE = int(os.environ.get("MAX_DB_SIZE", str(7 * 1024 * 1024)))
-MAX_TOTAL_ITEMS = int(os.environ.get("MAX_TOTAL_ITEMS", "220"))
-MAX_ITEMS_PER_USER = int(os.environ.get("MAX_ITEMS_PER_USER", "70"))
-MAX_DRAW_POINTS = int(os.environ.get("MAX_DRAW_POINTS", "260"))
+
+MAX_TOTAL_ITEMS = int(os.environ.get("MAX_TOTAL_ITEMS", "400"))
+MAX_ITEMS_PER_USER = int(os.environ.get("MAX_ITEMS_PER_USER", "100"))
+MAX_DRAW_POINTS = int(os.environ.get("MAX_DRAW_POINTS", "300"))
 
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
 FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
@@ -183,7 +181,9 @@ def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if not current_user():
-            return jsonify({"ok": False, "error": "Login first."}), 401 if request.path.startswith("/api/") else redirect(url_for("home"))
+            if request.path.startswith("/api/"):
+                return jsonify({"ok": False, "error": "Login first."}), 401
+            return redirect(url_for("home"))
         return fn(*args, **kwargs)
     return wrapper
 
@@ -198,7 +198,7 @@ def allowed_audio(filename):
 
 def blank_db():
     return {
-        "version": 3,
+        "version": 4,
         "users": {},
         "items": {},
         "created_at": now_ms(),
@@ -218,7 +218,7 @@ def normalize_db(db):
     if not isinstance(clean.get("items"), dict):
         clean["items"] = {}
 
-    clean["version"] = 3
+    clean["version"] = 4
     clean.setdefault("created_at", now_ms())
     clean.setdefault("updated_at", now_ms())
     return clean
@@ -227,11 +227,11 @@ def normalize_db(db):
 def item_limit_ok(db, user):
     total = len(db.get("items", {}))
     if total >= MAX_TOTAL_ITEMS:
-        return False, "Board is full. Delete old items first."
+        return False, "board full"
 
     mine = len([x for x in db.get("items", {}).values() if x.get("user_id") == user.get("id")])
     if mine >= MAX_ITEMS_PER_USER:
-        return False, "You reached your item limit. Delete old items first."
+        return False, "item limit reached"
 
     return True, ""
 
@@ -244,7 +244,7 @@ def rate_limit_user(db, user, key, seconds):
     remaining = seconds - (int(time.time()) - last)
 
     if remaining > 0 and not is_staff_email(live.get("email", "")):
-        return False, f"Slow down. Try again in {remaining} seconds."
+        return False, f"wait {remaining}s"
 
     cooldowns[key] = int(time.time())
     users[live["id"]] = live
@@ -252,15 +252,33 @@ def rate_limit_user(db, user, key, seconds):
     return True, ""
 
 
+def item_bounds(item):
+    x = int(item.get("x", 0))
+    y = int(item.get("y", 0))
+    w = int(item.get("w", 100))
+    h = int(item.get("h", 100))
+    return x, y, w, h
+
+
+def intersects(item, left, top, right, bottom, margin=900):
+    x, y, w, h = item_bounds(item)
+    return not (
+        x + w < left - margin or
+        x > right + margin or
+        y + h < top - margin or
+        y > bottom + margin
+    )
+
+
 # -----------------------------
-# Storage
+# Discord snapshot storage
 # -----------------------------
 
 def require_storage_config():
     if not DISCORD_BOT_TOKEN:
-        raise RuntimeError("Missing DISCORD_BOT_TOKEN in Render environment.")
+        raise RuntimeError("Missing DISCORD_BOT_TOKEN.")
     if not DISCORD_DB_CHANNEL_ID:
-        raise RuntimeError("Missing DISCORD_DB_CHANNEL_ID in Render environment.")
+        raise RuntimeError("Missing DISCORD_DB_CHANNEL_ID.")
 
 
 def discord_request(method, endpoint, **kwargs):
@@ -282,11 +300,11 @@ def discord_request(method, endpoint, **kwargs):
             continue
 
         if not (200 <= r.status_code < 300):
-            raise RuntimeError(f"Storage API error {r.status_code}: {r.text[:500]}")
+            raise RuntimeError(f"storage error {r.status_code}")
 
         return r
 
-    raise RuntimeError("Storage API rate-limit retry failed.")
+    raise RuntimeError("storage rate limit")
 
 
 def clear_cache():
@@ -411,10 +429,10 @@ def save_db(db):
     raw = gzip.compress(raw_json, compresslevel=6)
 
     if len(raw) > MAX_DB_SIZE:
-        raise ValueError("Board data is too large. Delete old items first.")
+        raise ValueError("board data too large")
 
     post_attachment(
-        content=f"WBDBSNAP|v3|gz|{int(time.time())}",
+        content=f"WBDBSNAP|v4|gz|{int(time.time())}",
         filename="whiteboard-db.json.gz",
         file_bytes=raw,
         content_type="application/gzip",
@@ -487,14 +505,14 @@ def public_item(item, user=None):
         "type": kind,
         "user_id": item.get("user_id", ""),
         "username": item.get("username", "unknown"),
-        "x": int(item.get("x", 120)),
-        "y": int(item.get("y", 120)),
+        "x": int(item.get("x", 0)),
+        "y": int(item.get("y", 0)),
         "w": int(item.get("w", 220)),
         "h": int(item.get("h", 140)),
         "z": int(item.get("z", 1)),
         "text": item.get("text", ""),
         "color": item.get("color", "#111111"),
-        "bg": item.get("bg", "#fff8cc"),
+        "bg": item.get("bg", "#ffffff"),
         "font": int(item.get("font", 18)),
         "stroke": item.get("stroke", "#111111"),
         "stroke_width": int(item.get("stroke_width", 4)),
@@ -513,8 +531,11 @@ def public_item(item, user=None):
     return out
 
 
-def all_public_items(db, user=None):
-    items = [public_item(x, user) for x in db["items"].values()]
+def visible_items(db, user, left, top, right, bottom):
+    items = []
+    for raw in db.get("items", {}).values():
+        if intersects(raw, left, top, right, bottom, margin=1200):
+            items.append(public_item(raw, user))
     items.sort(key=lambda x: (x["z"], x["created"]))
     return items
 
@@ -531,613 +552,422 @@ HTML = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{box-sizing:border-box}
-:root{
-    --glass:rgba(255,255,255,.26);
-    --glass2:rgba(255,255,255,.16);
-    --line:rgba(255,255,255,.38);
-    --dark:rgba(20,24,32,.82);
-    --muted:rgba(20,24,32,.55);
-    --blue:#1976ff;
-    --red:#ff4d5d;
-    --shadow:0 22px 80px rgba(31,42,68,.16);
-}
-html,body{margin:0;height:100%;overflow:hidden}
-body{
-    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif;
-    color:var(--dark);
-    background:
-        radial-gradient(circle at 16% 12%, rgba(173,210,255,.72), transparent 33%),
-        radial-gradient(circle at 82% 10%, rgba(255,220,245,.64), transparent 31%),
-        radial-gradient(circle at 56% 88%, rgba(199,255,230,.58), transparent 35%),
-        linear-gradient(135deg,#f7f9ff,#e9eef8 44%,#f8f1ff);
-}
-body:before{
-    content:"";position:fixed;inset:0;pointer-events:none;
-    background:linear-gradient(rgba(255,255,255,.42) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.42) 1px,transparent 1px);
-    background-size:34px 34px;
-    mask-image:linear-gradient(to bottom,rgba(0,0,0,.55),rgba(0,0,0,.18));
-}
-button,input,textarea,select{font:inherit}
-button,.btn{
-    border:1px solid var(--line);
-    background:rgba(255,255,255,.24);
-    color:var(--dark);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.55),0 10px 24px rgba(31,42,68,.10);
-    backdrop-filter:blur(22px) saturate(150%);
-    border-radius:3px;
-    padding:10px 13px;
-    font-weight:800;
-    cursor:pointer;
-    text-decoration:none;
-    display:inline-flex;
-    justify-content:center;
-    align-items:center;
-}
-button:hover,.btn:hover{background:rgba(255,255,255,.36)}
-.primary{background:rgba(25,118,255,.88)!important;color:white!important;border-color:rgba(25,118,255,.35)!important}
-.danger{background:rgba(255,77,93,.14)!important;color:#b02034!important;border-color:rgba(255,77,93,.24)!important}
-.topbar{
-    position:fixed;z-index:100;left:18px;right:18px;top:14px;height:54px;
-    display:flex;align-items:center;justify-content:space-between;gap:12px;
-    padding:10px 14px;border:1px solid var(--line);border-radius:4px;
-    background:var(--glass);backdrop-filter:blur(34px) saturate(210%);
-    box-shadow:var(--shadow);
-}
-.logo{display:flex;align-items:center;gap:10px;font-weight:900;letter-spacing:-.75px;font-size:20px}
-.logo-mark{
-    width:32px;height:32px;border-radius:3px;
-    background:linear-gradient(135deg,rgba(255,255,255,.95),rgba(180,216,255,.92) 42%,rgba(25,118,255,.9));
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.75),0 8px 18px rgba(25,118,255,.22);
-}
-.nav{display:flex;align-items:center;gap:8px}
-.user-pill{
-    font-size:13px;padding:8px 11px;border-radius:3px;background:rgba(255,255,255,.42);
-    border:1px solid var(--line);font-weight:800;backdrop-filter:blur(18px);
-}
-.alert,.success{
-    position:fixed;z-index:101;top:78px;left:50%;transform:translateX(-50%);
-    padding:10px 14px;border-radius:3px;font-weight:800;font-size:14px;border:1px solid;
-    backdrop-filter:blur(24px);box-shadow:var(--shadow);
-}
-.alert{background:rgba(255,239,239,.78);border-color:rgba(255,77,93,.28);color:#982033}
-.success{background:rgba(235,255,241,.78);border-color:rgba(38,170,84,.24);color:#13622e}
-.workspace{position:fixed;inset:0;padding-top:0}
-.board-wrap{position:absolute;inset:0;overflow:auto;padding:92px 28px 32px 116px}
-.board{
-    position:relative;width:{{ board_w }}px;height:{{ board_h }}px;
-    background:
-        linear-gradient(rgba(40,54,80,.035) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(40,54,80,.035) 1px, transparent 1px),
-        rgba(255,255,255,.74);
-    background-size:30px 30px,30px 30px,100% 100%;
-    border:1px solid rgba(255,255,255,.34);
-    border-radius:4px;
-    box-shadow:0 30px 90px rgba(30,42,68,.16),inset 0 1px 0 rgba(255,255,255,.55),inset 0 0 0 1px rgba(255,255,255,.18);
-    overflow:hidden;
-    backdrop-filter:blur(18px);
-}
-.tool-rail{
-    position:fixed;z-index:90;left:18px;top:92px;width:72px;
-    padding:10px;border-radius:4px;border:1px solid var(--line);
-    background:rgba(255,255,255,.18);backdrop-filter:blur(36px) saturate(220%);
-    box-shadow:var(--shadow);
-    display:flex;flex-direction:column;gap:9px;
-}
-.tool-btn{
-    width:50px;height:50px;padding:0;border-radius:3px;font-size:18px;font-weight:900;
-}
-.tool-btn.active{background:rgba(25,118,255,.9)!important;color:white!important}
-.tool-panel{
-    position:fixed;z-index:89;left:102px;top:92px;width:286px;max-height:calc(100vh - 116px);overflow:auto;
-    border-radius:4px;border:1px solid var(--line);
-    background:rgba(255,255,255,.18);backdrop-filter:blur(38px) saturate(220%);
-    box-shadow:var(--shadow);
-    padding:14px;
-    display:none;
-}
-.tool-panel.show{display:block}
-.tool-title{font-size:14px;font-weight:900;margin:2px 0 12px;color:var(--dark)}
-.tool-line{height:1px;background:rgba(255,255,255,.26);margin:12px -2px}
-label{display:block;font-size:12px;font-weight:900;color:var(--muted);margin:10px 0 6px}
-input,textarea,select{
-    width:100%;border:1px solid rgba(255,255,255,.58);border-radius:3px;background:rgba(255,255,255,.26);
-    outline:none;padding:10px 11px;color:var(--dark);backdrop-filter:blur(18px);
-}
-textarea{min-height:92px;resize:vertical}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.small{font-size:12px;color:var(--muted);line-height:1.42}
-.board-item{
-    position:absolute;border-radius:4px;box-shadow:0 14px 34px rgba(31,42,68,.20);
-    user-select:none;touch-action:none;
-}
-.board-item.can-edit{cursor:move}
-.text-item{
-    border:1px solid rgba(255,255,255,.7);
-    padding:14px 15px;
-    white-space:pre-wrap;
-    line-height:1.25;
-    overflow:hidden;
-    backdrop-filter:blur(14px);
-}
-.image-item,.audio-item,.drawing-item{
-    border:1px solid rgba(255,255,255,.72);
-    background:rgba(255,255,255,.22);
-    padding:7px;
-    overflow:hidden;
-    backdrop-filter:blur(14px);
-}
-.image-item img{width:100%;height:100%;object-fit:contain;display:block;border-radius:3px;pointer-events:none}
-.audio-card{
-    width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;gap:8px;
-    padding:11px;background:rgba(255,255,255,.18);border-radius:3px;
-}
-.audio-card audio{width:100%}
-.drawing-item svg{width:100%;height:100%;display:block;overflow:visible}
-.toolbar{
-    position:absolute;left:0;top:-40px;display:none;gap:5px;white-space:nowrap;z-index:9999;
-}
-.board-item.can-edit:hover .toolbar{display:flex}
-.toolbar button{
-    font-size:12px;padding:7px 9px;border-radius:3px;background:rgba(255,255,255,.30)!important;color:var(--dark)!important;
-}
-.user-tag{
-    position:absolute;right:7px;bottom:6px;font-size:11px;padding:4px 7px;border-radius:3px;
-    background:rgba(255,255,255,.26);color:rgba(20,24,32,.55);font-weight:800;
-}
-#drawCanvas{position:absolute;left:0;top:0;width:{{ board_w }}px;height:{{ board_h }}px;z-index:9998;display:none;cursor:crosshair}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif}
+button,input,textarea{font:inherit}
+#viewport{position:fixed;inset:0;overflow:hidden;background:#fff;cursor:default}
+#world{position:absolute;left:0;top:0;transform-origin:0 0}
+.item{position:absolute;user-select:none;touch-action:none}
+.item.editable{cursor:move}
+.text-item{background:#fff;white-space:pre-wrap;overflow:hidden;padding:10px 12px;line-height:1.22}
+.image-item img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
+.audio-item{background:#fff;padding:8px}
+.audio-item audio{width:100%}
+.draw-item svg{width:100%;height:100%;display:block;overflow:visible}
+.tag{position:absolute;right:3px;bottom:2px;font-size:10px;color:#aaa;background:rgba(255,255,255,.65);padding:1px 4px}
+.toolbar{position:absolute;left:0;top:-34px;display:none;gap:4px;z-index:10}
+.item.editable:hover .toolbar{display:flex}
+.toolbar button{border:0;background:#111;color:#fff;font-size:11px;padding:6px 7px}
+#drawCanvas{position:absolute;left:0;top:0;width:4000px;height:4000px;display:none;z-index:9998;cursor:crosshair}
 body.draw-mode #drawCanvas{display:block}
-.blur-lock{
-    position:fixed;inset:0;z-index:99999;background:rgba(242,246,255,.28);backdrop-filter:blur(30px) saturate(210%);
-    display:flex;align-items:center;justify-content:center;padding:18px;
-}
-.login-box{
-    width:min(440px,94vw);border-radius:4px;border:1px solid var(--line);
-    background:rgba(255,255,255,.20);backdrop-filter:blur(42px) saturate(230%);
-    box-shadow:0 30px 100px rgba(31,42,68,.28);overflow:hidden;
-}
-.login-head{padding:20px 20px 10px;font-weight:950;font-size:24px;letter-spacing:-1px}
-.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:14px 18px 4px}
-.login-content{padding:0 18px 18px}
+#tools{position:fixed;z-index:100;left:14px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px}
+.tool{width:44px;height:44px;border:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.08);font-weight:900;font-size:16px}
+.tool.active{background:#111;color:#fff}
+.panel{position:fixed;z-index:99;left:66px;top:50%;transform:translateY(-50%);width:260px;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:12px;display:none}
+.panel.show{display:block}
+label{display:block;font-size:11px;font-weight:800;color:#777;margin:8px 0 5px}
+input,textarea{width:100%;border:0;background:rgba(240,240,240,.75);outline:0;padding:9px}
+textarea{min-height:90px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.btn{border:0;background:#111;color:white;padding:10px 12px;font-weight:800;margin-top:8px}
+.btn2{border:0;background:#eee;color:#111;padding:10px 12px;font-weight:800;margin-top:8px}
+#loginOverlay{position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:flex;align-items:center;justify-content:center}
+#loginBox{width:min(390px,92vw);background:rgba(255,255,255,.82);backdrop-filter:blur(26px);box-shadow:0 30px 100px rgba(0,0,0,.14);padding:18px}
+#settingsOverlay{position:fixed;inset:0;z-index:99998;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:none;align-items:center;justify-content:center}
 .hidden{display:none!important}
-@media(max-width:850px){
-    html,body{overflow:auto}
-    .topbar{left:10px;right:10px;top:10px}
-    .board-wrap{position:relative;height:72vh;padding:92px 16px 18px 96px}
-    .tool-rail{left:12px;top:82px}
-    .tool-panel{left:92px;right:12px;width:auto;top:82px}
-}
+.msg{position:fixed;z-index:1000;top:12px;left:50%;transform:translateX(-50%);background:#111;color:white;padding:9px 12px;font-size:13px}
 </style>
 </head>
 <body>
-<div class="topbar">
-    <div class="logo"><span class="logo-mark"></span>{{ app_name }}</div>
-    <div class="nav">
-        {% if user %}
-            <span class="user-pill">@{{ user.username }}</span>
-            <button onclick="openSettings()">Settings</button>
-            <a class="btn" href="{{ url_for('logout') }}">Logout</a>
-        {% else %}
-            <span class="user-pill">guest</span>
-        {% endif %}
-    </div>
-</div>
 
 {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
         {% for category,message in messages %}
-            <div class="{{ 'success' if category == 'success' else 'alert' }}">{{ message }}</div>
+            <div class="msg">{{ message }}</div>
         {% endfor %}
     {% endif %}
 {% endwith %}
 
-<div class="workspace">
-    {% if user %}
-    <div class="tool-rail">
-        <button class="tool-btn active" data-tool="text" onclick="showTool('text')">T</button>
-        <button class="tool-btn" data-tool="image" onclick="showTool('image')">◎</button>
-        <button class="tool-btn" data-tool="audio" onclick="showTool('audio')">♫</button>
-        <button class="tool-btn" data-tool="draw" onclick="showTool('draw')">✎</button>
-        {% if staff %}
-        <a class="tool-btn btn" href="{{ url_for('cleanup_route') }}" title="clean">⌫</a>
-        {% endif %}
+<div id="viewport">
+    <div id="world">
+        <canvas id="drawCanvas" width="4000" height="4000"></canvas>
     </div>
-
-    <section id="tool-text" class="tool-panel show">
-        <div class="tool-title">Text</div>
-        <form action="{{ url_for('add_text') }}" method="POST">
-            <label>Text</label>
-            <textarea name="text" placeholder="write something" required></textarea>
-            <div class="form-row">
-                <div><label>Text</label><input name="color" type="color" value="#111111"></div>
-                <div><label>Box</label><input name="bg" type="color" value="#fff8cc"></div>
-            </div>
-            <label>Size</label>
-            <input name="font" type="number" value="18" min="10" max="60">
-            <div class="tool-line"></div>
-            <button class="primary" type="submit">Add</button>
-        </form>
-    </section>
-
-    <section id="tool-image" class="tool-panel">
-        <div class="tool-title">Image</div>
-        <form action="{{ url_for('add_image') }}" method="POST" enctype="multipart/form-data">
-            <input name="image" type="file" accept=".png,.jpg,.jpeg,.gif,.webp" required>
-            <div class="tool-line"></div>
-            <button class="primary" type="submit">Upload</button>
-        </form>
-    </section>
-
-    <section id="tool-audio" class="tool-panel">
-        <div class="tool-title">Audio</div>
-        <form action="{{ url_for('add_audio') }}" method="POST" enctype="multipart/form-data">
-            <input name="audio" type="file" accept=".mp3,.wav,.ogg,.m4a" required>
-            <div class="tool-line"></div>
-            <button class="primary" type="submit">Upload</button>
-        </form>
-    </section>
-
-    <section id="tool-draw" class="tool-panel">
-        <div class="tool-title">Draw</div>
-        <div class="form-row">
-            <div><label>Color</label><input id="drawColor" type="color" value="#111111"></div>
-            <div><label>Size</label><input id="drawSize" type="number" value="4" min="1" max="30"></div>
-        </div>
-        <div class="tool-line"></div>
-        <button id="drawToggle" class="primary" onclick="toggleDraw()">Start</button>
-        <p class="small">One stroke saves when you release the mouse.</p>
-    </section>
-    {% endif %}
-
-    <main class="board-wrap">
-        <div id="board" class="board">
-            {{ board_items|safe }}
-            <canvas id="drawCanvas" width="{{ board_w }}" height="{{ board_h }}"></canvas>
-        </div>
-    </main>
 </div>
 
-{% if not user %}
-<div class="blur-lock">
-    <div class="login-box">
-        <div class="login-head">your name..</div>
-        <div class="tabs">
-            <button class="primary" onclick="showAuth('register')">Create</button>
-            <button onclick="showAuth('login')">Login</button>
-        </div>
-        <div class="login-content">
-            <form id="registerBox" action="{{ url_for('register') }}" method="POST">
-                <label>Name</label>
-                <input name="username" placeholder="your name" required>
-                <label>Email</label>
-                <input name="email" type="email" placeholder="email" required>
-                <label>Password</label>
-                <input name="password" type="password" placeholder="password" required>
-                <div class="tool-line"></div>
-                <button class="primary" type="submit">Create Account</button>
-            </form>
+{% if user %}
+<div id="tools">
+    <button class="tool active" data-tool="text" onclick="showTool('text')">T</button>
+    <button class="tool" data-tool="image" onclick="showTool('image')">◎</button>
+    <button class="tool" data-tool="audio" onclick="showTool('audio')">♫</button>
+    <button class="tool" data-tool="draw" onclick="showTool('draw')">✎</button>
+    <button class="tool" onclick="openSettings()">⚙</button>
+</div>
 
-            <form id="loginBox" class="hidden" action="{{ url_for('login') }}" method="POST">
-                <label>Email or name</label>
-                <input name="email_or_user" placeholder="email or name" required>
-                <label>Password</label>
-                <input name="password" type="password" placeholder="password" required>
-                <div class="tool-line"></div>
-                <button class="primary" type="submit">Login</button>
-            </form>
+<div id="panel-text" class="panel show">
+    <form action="{{ url_for('add_text') }}" method="POST">
+        <input name="x" id="textX" type="hidden">
+        <input name="y" id="textY" type="hidden">
+        <label>text</label>
+        <textarea name="text" required></textarea>
+        <div class="row">
+            <div><label>text</label><input name="color" type="color" value="#111111"></div>
+            <div><label>box</label><input name="bg" type="color" value="#ffffff"></div>
         </div>
+        <label>size</label>
+        <input name="font" type="number" value="18" min="10" max="60">
+        <button class="btn" type="submit" onclick="fillCenter('textX','textY')">add</button>
+    </form>
+</div>
+
+<div id="panel-image" class="panel">
+    <form action="{{ url_for('add_image') }}" method="POST" enctype="multipart/form-data">
+        <input name="x" id="imageX" type="hidden">
+        <input name="y" id="imageY" type="hidden">
+        <label>image</label>
+        <input name="image" type="file" accept=".png,.jpg,.jpeg,.gif,.webp" required>
+        <button class="btn" type="submit" onclick="fillCenter('imageX','imageY')">upload</button>
+    </form>
+</div>
+
+<div id="panel-audio" class="panel">
+    <form action="{{ url_for('add_audio') }}" method="POST" enctype="multipart/form-data">
+        <input name="x" id="audioX" type="hidden">
+        <input name="y" id="audioY" type="hidden">
+        <label>audio</label>
+        <input name="audio" type="file" accept=".mp3,.wav,.ogg,.m4a" required>
+        <button class="btn" type="submit" onclick="fillCenter('audioX','audioY')">upload</button>
+    </form>
+</div>
+
+<div id="panel-draw" class="panel">
+    <div class="row">
+        <div><label>color</label><input id="drawColor" type="color" value="#111111"></div>
+        <div><label>size</label><input id="drawSize" type="number" value="4" min="1" max="30"></div>
+    </div>
+    <button id="drawToggle" class="btn" onclick="toggleDraw()">start</button>
+</div>
+
+<div id="settingsOverlay">
+    <div id="loginBox">
+        <form action="{{ url_for('settings') }}" method="POST">
+            <label>name</label>
+            <input name="username" value="{{ user.username }}" required>
+            <button class="btn" type="submit">save</button>
+            <button class="btn2" type="button" onclick="closeSettings()">cancel</button>
+        </form>
     </div>
 </div>
 {% endif %}
 
-<div id="settingsModal" class="blur-lock hidden">
-    <div class="login-box">
-        <div class="login-head">Settings</div>
-        <div class="login-content" style="padding-top:10px">
-            <form action="{{ url_for('settings') }}" method="POST">
-                <label>Name</label>
-                <input name="username" value="{{ user.username if user else '' }}" required>
-                <p class="small">You can change your name once every 10 days.</p>
-                <div class="tool-line"></div>
-                <button class="primary" type="submit">Save</button>
-                <button type="button" onclick="closeSettings()">Cancel</button>
-            </form>
-        </div>
+{% if not user %}
+<div id="loginOverlay">
+    <div id="loginBox">
+        <form id="registerBox" action="{{ url_for('register') }}" method="POST">
+            <input name="username" placeholder="your name.." required>
+            <br><br>
+            <input name="email" type="email" placeholder="email" required>
+            <br><br>
+            <input name="password" type="password" placeholder="password" required>
+            <button class="btn" type="submit">create</button>
+            <button class="btn2" type="button" onclick="showAuth('login')">login</button>
+        </form>
+
+        <form id="loginBoxForm" class="hidden" action="{{ url_for('login') }}" method="POST">
+            <input name="email_or_user" placeholder="email or name" required>
+            <br><br>
+            <input name="password" type="password" placeholder="password" required>
+            <button class="btn" type="submit">login</button>
+            <button class="btn2" type="button" onclick="showAuth('register')">create</button>
+        </form>
     </div>
 </div>
+{% endif %}
 
 <script>
-const CURRENT_USER = {{ current_user_id|tojson }};
-const BOARD_W = {{ board_w|tojson }};
-const BOARD_H = {{ board_h|tojson }};
-let ITEMS = {{ items|tojson }};
+let camera = {x: Number(localStorage.camX || 0), y: Number(localStorage.camY || 0)};
+let loaded = new Map();
+let loading = false;
+let lastLoadKey = "";
+const viewport = document.getElementById("viewport");
+const world = document.getElementById("world");
 
-function q(id){ return document.getElementById(id); }
+function screenToWorld(sx, sy){
+    return {x: Math.round(sx - camera.x), y: Math.round(sy - camera.y)};
+}
+function centerWorld(){
+    return screenToWorld(window.innerWidth/2, window.innerHeight/2);
+}
+function fillCenter(xid,yid){
+    const p = centerWorld();
+    const x = document.getElementById(xid);
+    const y = document.getElementById(yid);
+    if(x) x.value = p.x;
+    if(y) y.value = p.y;
+}
+function applyCamera(){
+    world.style.transform = `translate(${camera.x}px, ${camera.y}px)`;
+    localStorage.camX = camera.x;
+    localStorage.camY = camera.y;
+    scheduleLoad();
+}
+applyCamera();
 
 function showTool(name){
-    document.querySelectorAll(".tool-panel").forEach(x=>x.classList.remove("show"));
-    document.querySelectorAll(".tool-btn").forEach(x=>x.classList.remove("active"));
-    const panel = q("tool-" + name);
-    const btn = document.querySelector(`[data-tool="${name}"]`);
-    if(panel) panel.classList.add("show");
-    if(btn) btn.classList.add("active");
+    document.querySelectorAll(".panel").forEach(x=>x.classList.remove("show"));
+    document.querySelectorAll(".tool").forEach(x=>x.classList.remove("active"));
+    const p = document.getElementById("panel-"+name);
+    const b = document.querySelector(`[data-tool="${name}"]`);
+    if(p) p.classList.add("show");
+    if(b) b.classList.add("active");
+}
+function showAuth(which){
+    document.getElementById("registerBox").classList.toggle("hidden", which !== "register");
+    document.getElementById("loginBoxForm").classList.toggle("hidden", which !== "login");
+}
+function openSettings(){ document.getElementById("settingsOverlay").style.display="flex"; }
+function closeSettings(){ document.getElementById("settingsOverlay").style.display="none"; }
+
+let panning=false, panStart={x:0,y:0}, camStart={x:0,y:0};
+viewport.addEventListener("contextmenu", e=>e.preventDefault());
+viewport.addEventListener("mousedown", e=>{
+    if(e.button !== 2) return;
+    panning=true;
+    panStart={x:e.clientX,y:e.clientY};
+    camStart={x:camera.x,y:camera.y};
+    viewport.style.cursor="grabbing";
+});
+document.addEventListener("mousemove", e=>{
+    if(!panning) return;
+    camera.x = camStart.x + (e.clientX-panStart.x);
+    camera.y = camStart.y + (e.clientY-panStart.y);
+    applyCamera();
+});
+document.addEventListener("mouseup", ()=>{
+    if(panning){
+        panning=false;
+        viewport.style.cursor="default";
+        loadViewport();
+    }
+});
+
+function itemHtml(item){
+    const editable = item.can_edit ? " editable" : "";
+    let html = "";
+    let style = `left:${item.x}px;top:${item.y}px;width:${item.w}px;height:${item.h}px;z-index:${item.z};`;
+
+    let toolbar = "";
+    if(item.can_edit){
+        const edit = item.type === "text" ? `<button onclick="editText('${item.id}')">edit</button>` : "";
+        toolbar = `<div class="toolbar">${edit}<button onclick="resizeItem('${item.id}',25)">+</button><button onclick="resizeItem('${item.id}',-25)">-</button><button onclick="layerItem('${item.id}',1)">front</button><button onclick="layerItem('${item.id}',-1)">back</button><button onclick="deleteItem('${item.id}')">del</button></div>`;
+    }
+
+    if(item.type === "text"){
+        style += `background:${item.bg};color:${item.color};font-size:${item.font}px;`;
+        html = `<div id="item-${item.id}" class="item text-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<div data-text-body></div><div class="tag">@${escapeHtml(item.username)}</div></div>`;
+    }else if(item.type === "image"){
+        html = `<div id="item-${item.id}" class="item image-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<img src="${item.file_url}"><div class="tag">@${escapeHtml(item.username)}</div></div>`;
+    }else if(item.type === "audio"){
+        html = `<div id="item-${item.id}" class="item audio-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<audio controls preload="none" src="${item.file_url}"></audio><div class="tag">@${escapeHtml(item.username)}</div></div>`;
+    }else{
+        const pts = (item.points || []).map(p=>`${p.x},${p.y}`).join(" ");
+        html = `<div id="item-${item.id}" class="item draw-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<svg viewBox="0 0 ${item.w} ${item.h}" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${item.stroke}" stroke-width="${item.stroke_width}" stroke-linecap="round" stroke-linejoin="round"/></svg><div class="tag">@${escapeHtml(item.username)}</div></div>`;
+    }
+    return html;
+}
+function escapeHtml(s){
+    return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
 }
 
-function showAuth(which){
-    q("registerBox").classList.toggle("hidden", which !== "register");
-    q("loginBox").classList.toggle("hidden", which !== "login");
+function unloadFarItems(){
+    const left = -camera.x - 2200;
+    const top = -camera.y - 2200;
+    const right = -camera.x + window.innerWidth + 2200;
+    const bottom = -camera.y + window.innerHeight + 2200;
+    for(const [id,item] of loaded.entries()){
+        if(item.x + item.w < left || item.x > right || item.y + item.h < top || item.y > bottom){
+            const el = document.getElementById("item-"+id);
+            if(el) el.remove();
+            loaded.delete(id);
+        }
+    }
 }
-function openSettings(){ q("settingsModal").classList.remove("hidden"); }
-function closeSettings(){ q("settingsModal").classList.add("hidden"); }
+
+let loadTimer = null;
+function scheduleLoad(){
+    clearTimeout(loadTimer);
+    loadTimer = setTimeout(loadViewport, 120);
+}
+async function loadViewport(){
+    if(loading) return;
+    const left = Math.round(-camera.x);
+    const top = Math.round(-camera.y);
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const key = `${Math.floor(left/700)}:${Math.floor(top/700)}:${Math.floor(w/500)}:${Math.floor(h/500)}`;
+    if(key === lastLoadKey) return;
+    lastLoadKey = key;
+    loading = true;
+    try{
+        const res = await fetch(`/api/items?x=${left}&y=${top}&w=${w}&h=${h}`);
+        const data = await res.json();
+        if(data.ok){
+            data.items.forEach(item=>{
+                if(loaded.has(item.id)) return;
+                loaded.set(item.id,item);
+                world.insertAdjacentHTML("beforeend", itemHtml(item));
+                const el = document.getElementById("item-"+item.id);
+                if(item.type === "text"){
+                    el.querySelector("[data-text-body]").textContent = item.text || "";
+                }
+            });
+            bindDragging();
+            unloadFarItems();
+        }
+    }catch(e){}
+    loading=false;
+}
+window.addEventListener("resize", scheduleLoad);
+setInterval(()=>{ lastLoadKey=""; loadViewport(); }, 15000);
+loadViewport();
 
 async function postJson(url, data){
-    const res = await fetch(url, {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify(data || {})
-    });
-    let out = {};
-    try{ out = await res.json(); }catch(e){}
-    if(!res.ok || out.ok === false){
-        alert(out.error || "Action failed");
-        return null;
-    }
+    const res = await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data||{})});
+    let out={};
+    try{out=await res.json();}catch(e){}
+    if(!res.ok || out.ok===false){ alert(out.error || "failed"); return null; }
     return out;
 }
-
-function getItem(id){ return ITEMS.find(x => x.id === id); }
-
+function getItem(id){ return loaded.get(id); }
 function editText(id){
-    const item = getItem(id);
-    if(!item) return;
-    const next = prompt("Edit text:", item.text || "");
-    if(next === null) return;
-    postJson("/api/edit-text/" + encodeURIComponent(id), {text: next}).then(out=>{
-        if(!out) return;
-        item.text = next;
-        const el = q("item-" + id);
-        const body = el.querySelector("[data-text-body]");
-        if(body) body.textContent = next;
+    const item=getItem(id); if(!item) return;
+    const next=prompt("edit", item.text||""); if(next===null) return;
+    postJson("/api/edit-text/"+id,{text:next}).then(out=>{
+        if(!out)return;
+        item.text=next;
+        const el=document.getElementById("item-"+id);
+        if(el) el.querySelector("[data-text-body]").textContent=next;
     });
 }
-
 function deleteItem(id){
-    if(!confirm("Delete this board item?")) return;
-    postJson("/api/delete-item/" + encodeURIComponent(id), {}).then(out=>{
-        if(!out) return;
-        const el = q("item-" + id);
-        if(el) el.remove();
-        ITEMS = ITEMS.filter(x => x.id !== id);
+    if(!confirm("delete?")) return;
+    postJson("/api/delete-item/"+id,{}).then(out=>{
+        if(!out)return;
+        const el=document.getElementById("item-"+id); if(el) el.remove();
+        loaded.delete(id);
     });
 }
-
-function resizeItem(id, delta){
-    const item = getItem(id);
-    if(!item) return;
-    item.w = Math.max(70, Math.min(800, item.w + delta));
-    item.h = Math.max(55, Math.min(600, item.h + delta));
-    const el = q("item-" + id);
-    if(el){
-        el.style.width = item.w + "px";
-        el.style.height = item.h + "px";
-    }
-    saveItemPosition(item);
+function resizeItem(id,delta){
+    const item=getItem(id); if(!item)return;
+    item.w=Math.max(50,Math.min(900,item.w+delta));
+    item.h=Math.max(45,Math.min(700,item.h+delta));
+    const el=document.getElementById("item-"+id);
+    if(el){el.style.width=item.w+"px";el.style.height=item.h+"px";}
+    savePos(item);
 }
-
-function layerItem(id, delta){
-    const item = getItem(id);
-    if(!item) return;
-    item.z = Math.max(1, Math.min(9999, item.z + delta));
-    const el = q("item-" + id);
-    if(el) el.style.zIndex = item.z;
-    saveItemPosition(item);
+function layerItem(id,delta){
+    const item=getItem(id); if(!item)return;
+    item.z=Math.max(1,Math.min(9999,item.z+delta));
+    const el=document.getElementById("item-"+id); if(el)el.style.zIndex=item.z;
+    savePos(item);
 }
-
-let lastMoveSave = 0;
-function saveItemPosition(item){
-    const now = Date.now();
-    if(now - lastMoveSave < 850) return;
-    lastMoveSave = now;
-    postJson("/api/move-item/" + encodeURIComponent(item.id), {
-        x:item.x, y:item.y, w:item.w, h:item.h, z:item.z
-    });
+let lastMoveSave=0;
+function savePos(item){
+    const n=Date.now();
+    if(n-lastMoveSave<850)return;
+    lastMoveSave=n;
+    postJson("/api/move-item/"+item.id,{x:item.x,y:item.y,w:item.w,h:item.h,z:item.z});
 }
-
 function bindDragging(){
-    document.querySelectorAll(".board-item.can-edit").forEach(el=>{
-        if(el.dataset.bound === "1") return;
-        el.dataset.bound = "1";
-        let dragging = false;
-        let startX = 0, startY = 0, startLeft = 0, startTop = 0;
-
-        el.addEventListener("mousedown", e=>{
-            if(e.target.closest("button") || document.body.classList.contains("draw-mode")) return;
-            dragging = true;
-            startX = e.clientX;
-            startY = e.clientY;
-            startLeft = parseInt(el.style.left || "0");
-            startTop = parseInt(el.style.top || "0");
-            el.style.opacity = ".82";
-            document.body.style.userSelect = "none";
+    document.querySelectorAll(".item.editable").forEach(el=>{
+        if(el.dataset.bound==="1")return;
+        el.dataset.bound="1";
+        let drag=false, sx=0, sy=0, ox=0, oy=0;
+        el.addEventListener("mousedown",e=>{
+            if(e.button===2 || e.target.closest("button") || document.body.classList.contains("draw-mode"))return;
+            drag=true; sx=e.clientX; sy=e.clientY;
+            ox=parseInt(el.style.left||"0"); oy=parseInt(el.style.top||"0");
             e.preventDefault();
         });
-
-        document.addEventListener("mousemove", e=>{
-            if(!dragging) return;
-            const dx = e.clientX - startX;
-            const dy = e.clientY - startY;
-            const id = el.dataset.id;
-            const item = getItem(id);
-            if(!item) return;
-            const nx = Math.max(0, Math.min(BOARD_W - item.w, startLeft + dx));
-            const ny = Math.max(0, Math.min(BOARD_H - item.h, startTop + dy));
-            item.x = Math.round(nx);
-            item.y = Math.round(ny);
-            el.style.left = item.x + "px";
-            el.style.top = item.y + "px";
+        document.addEventListener("mousemove",e=>{
+            if(!drag)return;
+            const item=getItem(el.dataset.id); if(!item)return;
+            item.x=ox+(e.clientX-sx);
+            item.y=oy+(e.clientY-sy);
+            el.style.left=item.x+"px"; el.style.top=item.y+"px";
         });
-
-        document.addEventListener("mouseup", ()=>{
-            if(!dragging) return;
-            dragging = false;
-            el.style.opacity = "1";
-            document.body.style.userSelect = "";
-            const item = getItem(el.dataset.id);
-            if(item) saveItemPosition(item);
+        document.addEventListener("mouseup",()=>{
+            if(!drag)return;
+            drag=false;
+            const item=getItem(el.dataset.id); if(item) savePos(item);
         });
     });
 }
 
 // drawing
-let drawMode = false;
-let drawing = false;
-let points = [];
-const canvas = q("drawCanvas");
-const ctx = canvas ? canvas.getContext("2d") : null;
+let drawMode=false, drawing=false, points=[];
+const canvas=document.getElementById("drawCanvas");
+const ctx=canvas ? canvas.getContext("2d") : null;
 
 function toggleDraw(){
-    drawMode = !drawMode;
-    document.body.classList.toggle("draw-mode", drawMode);
-    const btn = q("drawToggle");
-    if(btn) btn.textContent = drawMode ? "Stop" : "Start";
+    drawMode=!drawMode;
+    document.body.classList.toggle("draw-mode",drawMode);
+    const b=document.getElementById("drawToggle");
+    if(b)b.textContent=drawMode?"stop":"start";
 }
-
-function boardPoint(e){
-    const rect = q("board").getBoundingClientRect();
-    return {
-        x: Math.round(e.clientX - rect.left),
-        y: Math.round(e.clientY - rect.top)
-    };
+function drawPoint(e){
+    const p=screenToWorld(e.clientX,e.clientY);
+    return {x:p.x+2000,y:p.y+2000, realX:p.x, realY:p.y};
 }
-
 if(canvas && ctx){
-    canvas.addEventListener("mousedown", e=>{
-        if(!drawMode) return;
-        drawing = true;
-        points = [];
-        const p = boardPoint(e);
-        points.push(p);
-        ctx.strokeStyle = q("drawColor").value || "#111111";
-        ctx.lineWidth = Math.max(1, Math.min(30, parseInt(q("drawSize").value || "4")));
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y);
+    canvas.addEventListener("mousedown",e=>{
+        if(!drawMode)return;
+        drawing=true; points=[];
+        const p=drawPoint(e);
+        points.push({x:p.realX,y:p.realY});
+        ctx.strokeStyle=document.getElementById("drawColor").value||"#111";
+        ctx.lineWidth=Math.max(1,Math.min(30,parseInt(document.getElementById("drawSize").value||"4")));
+        ctx.lineCap="round"; ctx.lineJoin="round"; ctx.beginPath(); ctx.moveTo(p.x,p.y);
         e.preventDefault();
     });
-
-    canvas.addEventListener("mousemove", e=>{
-        if(!drawMode || !drawing) return;
-        const p = boardPoint(e);
-        const last = points[points.length - 1];
-        if(last && Math.abs(last.x - p.x) + Math.abs(last.y - p.y) < 4) return;
-        points.push(p);
-        ctx.lineTo(p.x, p.y);
-        ctx.stroke();
+    canvas.addEventListener("mousemove",e=>{
+        if(!drawMode||!drawing)return;
+        const p=drawPoint(e);
+        const last=points[points.length-1];
+        if(last && Math.abs(last.x-p.realX)+Math.abs(last.y-p.realY)<4)return;
+        points.push({x:p.realX,y:p.realY});
+        ctx.lineTo(p.x,p.y); ctx.stroke();
     });
-
-    document.addEventListener("mouseup", ()=>{
-        if(!drawMode || !drawing) return;
-        drawing = false;
-        if(points.length < 2) return;
-        const color = q("drawColor").value || "#111111";
-        const size = parseInt(q("drawSize").value || "4");
-        postJson("/api/add-drawing", {points, stroke: color, stroke_width: size}).then(out=>{
-            ctx.clearRect(0,0,canvas.width,canvas.height);
-            if(out && out.reload) location.reload();
+    document.addEventListener("mouseup",()=>{
+        if(!drawMode||!drawing)return;
+        drawing=false;
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        if(points.length<2)return;
+        postJson("/api/add-drawing",{points,stroke:document.getElementById("drawColor").value,stroke_width:parseInt(document.getElementById("drawSize").value||"4")}).then(out=>{
+            lastLoadKey=""; loadViewport();
         });
     });
 }
-
-document.addEventListener("DOMContentLoaded", bindDragging);
-bindDragging();
 </script>
 </body>
 </html>
 """
 
 
-def render_board_item(item):
-    can_edit = bool(item.get("can_edit"))
-    classes = "board-item "
-    if item["type"] == "text":
-        classes += "text-item "
-    elif item["type"] == "image":
-        classes += "image-item "
-    elif item["type"] == "audio":
-        classes += "audio-item "
-    else:
-        classes += "drawing-item "
-    if can_edit:
-        classes += "can-edit"
-
-    style = f"left:{item['x']}px;top:{item['y']}px;width:{item['w']}px;height:{item['h']}px;z-index:{item['z']};"
-
-    if item["type"] == "text":
-        style += f"background:{esc(item['bg'])};color:{esc(item['color'])};font-size:{item['font']}px;"
-        inner = f"<div data-text-body>{esc(item['text'])}</div>"
-    elif item["type"] == "image":
-        inner = f"<img src='{esc(item['file_url'])}' alt='{esc(item['filename'])}'>"
-    elif item["type"] == "audio":
-        inner = f"""
-        <div class="audio-card">
-            <b>{esc(item['filename'])}</b>
-            <audio controls preload="none" src="{esc(item['file_url'])}"></audio>
-            <span class="small">{file_size_text(item['size'])}</span>
-        </div>
-        """
-    else:
-        pts = item.get("points", [])
-        point_str = " ".join(f"{int(p.get('x', 0))},{int(p.get('y', 0))}" for p in pts if isinstance(p, dict))
-        inner = f"""
-        <svg viewBox="0 0 {item['w']} {item['h']}" preserveAspectRatio="none">
-            <polyline points="{esc(point_str)}" fill="none" stroke="{esc(item.get('stroke', '#111111'))}" stroke-width="{int(item.get('stroke_width', 4))}" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        """
-
-    toolbar = ""
-    if can_edit:
-        edit_btn = ""
-        if item["type"] == "text":
-            edit_btn = f"<button onclick=\"editText('{esc(item['id'])}')\">edit</button>"
-        toolbar = f"""
-        <div class="toolbar">
-            {edit_btn}
-            <button onclick="resizeItem('{esc(item['id'])}', 25)">+</button>
-            <button onclick="resizeItem('{esc(item['id'])}', -25)">-</button>
-            <button onclick="layerItem('{esc(item['id'])}', 1)">front</button>
-            <button onclick="layerItem('{esc(item['id'])}', -1)">back</button>
-            <button class="danger" onclick="deleteItem('{esc(item['id'])}')">delete</button>
-        </div>
-        """
-
-    return f"""
-    <div id="item-{esc(item['id'])}" class="{classes}" data-id="{esc(item['id'])}" style="{style}">
-        {toolbar}
-        {inner}
-        <div class="user-tag">@{esc(item['username'])}</div>
-    </div>
-    """
-
-
-def html_page(items=None):
+def html_page():
     user = current_user()
     user_obj = None
     if user:
         user_obj = {"id": user.get("id", ""), "username": user.get("username", ""), "email": user.get("email", "")}
-
-    board_items = "".join(render_board_item(x) for x in (items or []))
-
-    return render_template_string(
-        HTML,
-        app_name=APP_NAME,
-        user=user_obj,
-        staff=current_is_staff(),
-        current_user_id=user.get("id", "") if user else "",
-        board_w=BOARD_W,
-        board_h=BOARD_H,
-        items=items or [],
-        board_items=board_items,
-    )
+    return render_template_string(HTML, user=user_obj)
 
 
 # -----------------------------
@@ -1146,12 +976,22 @@ def html_page(items=None):
 
 @app.route("/")
 def home():
+    return html_page()
+
+
+@app.route("/api/items")
+def api_items():
+    user = current_user()
+    x = clamp_int(request.args.get("x"), -10_000_000, 10_000_000, 0)
+    y = clamp_int(request.args.get("y"), -10_000_000, 10_000_000, 0)
+    w = clamp_int(request.args.get("w"), 100, 8000, 1600)
+    h = clamp_int(request.args.get("h"), 100, 8000, 1000)
     try:
         db = load_store()["db"]
-        items = all_public_items(db, current_user())
-    except Exception:
-        items = []
-    return html_page(items)
+        items = visible_items(db, user, x, y, x+w, y+h)
+        return jsonify({"ok": True, "items": items, "updated_at": db.get("updated_at", 0)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "items": []}), 500
 
 
 @app.route("/register", methods=["POST"])
@@ -1164,35 +1004,35 @@ def register():
     password = request.form.get("password", "")
 
     if not valid_username(username):
-        flash("Name must be 3-24 characters and use letters, numbers, dot, dash, or underscore.", "error")
+        flash("bad name", "error")
         return redirect(url_for("home"))
 
     if not EMAIL_REGEX.fullmatch(email):
-        flash("Use a real email format.", "error")
+        flash("bad email", "error")
         return redirect(url_for("home"))
 
     if len(password) < 6:
-        flash("Password must be at least 6 characters.", "error")
+        flash("password too short", "error")
         return redirect(url_for("home"))
 
     try:
         db = load_store(force=True)["db"]
     except Exception as e:
-        flash(f"Storage error: {e}", "error")
+        flash(str(e), "error")
         return redirect(url_for("home"))
 
     uid = user_id_from_email(email)
 
     for existing_id, existing in db["users"].items():
         if normalize_email(existing.get("email")) == email and existing_id != uid:
-            flash("Email already exists. Login instead.", "error")
+            flash("email exists", "error")
             return redirect(url_for("home"))
         if existing.get("username", "").lower() == username.lower() and existing_id != uid:
-            flash("Name already exists.", "error")
+            flash("name exists", "error")
             return redirect(url_for("home"))
 
     if uid in db["users"]:
-        flash("Account already exists. Login instead.", "error")
+        flash("account exists", "error")
         return redirect(url_for("home"))
 
     db["users"][uid] = {
@@ -1208,12 +1048,11 @@ def register():
     try:
         save_db(db)
     except Exception as e:
-        flash(f"Could not save account: {e}", "error")
+        flash(str(e), "error")
         return redirect(url_for("home"))
 
     session["email"] = email
     session["user_id"] = uid
-    flash("Account created.", "success")
     return redirect(url_for("home"))
 
 
@@ -1228,7 +1067,7 @@ def login():
     try:
         db = load_store(force=True)["db"]
     except Exception as e:
-        flash(f"Storage error: {e}", "error")
+        flash(str(e), "error")
         return redirect(url_for("home"))
 
     found = None
@@ -1238,19 +1077,17 @@ def login():
             break
 
     if not found or not check_password_hash(found.get("password_hash", ""), password):
-        flash("Wrong login.", "error")
+        flash("wrong login", "error")
         return redirect(url_for("home"))
 
     session["email"] = found.get("email", "")
     session["user_id"] = found.get("id", "")
-    flash("Logged in.", "success")
     return redirect(url_for("home"))
 
 
 @app.route("/logout")
 def logout():
     session.clear()
-    flash("Logged out.", "success")
     return redirect(url_for("home"))
 
 
@@ -1261,35 +1098,33 @@ def settings():
     new_name = clean_username(request.form.get("username"))
 
     if not valid_username(new_name):
-        flash("Name must be 3-24 characters and use letters, numbers, dot, dash, or underscore.", "error")
+        flash("bad name", "error")
         return redirect(url_for("home"))
 
     try:
         db = load_store(force=True)["db"]
     except Exception as e:
-        flash(f"Storage error: {e}", "error")
+        flash(str(e), "error")
         return redirect(url_for("home"))
 
     live_user = db["users"].get(user["id"])
     if not live_user:
         session.clear()
-        flash("Account not found. Login again.", "error")
         return redirect(url_for("home"))
 
     if new_name.lower() == live_user.get("username", "").lower():
-        flash("That is already your name.", "success")
         return redirect(url_for("home"))
 
     last_changed = int(live_user.get("name_changed_at", live_user.get("created", 0)) or 0)
     remaining = NAME_CHANGE_COOLDOWN_SECONDS - (int(time.time()) - last_changed)
 
     if remaining > 0 and not is_staff_email(live_user.get("email", "")):
-        flash(f"You can change your name again in {seconds_text(remaining)}.", "error")
+        flash(f"wait {seconds_text(remaining)}", "error")
         return redirect(url_for("home"))
 
     for existing_id, existing in db["users"].items():
         if existing_id != live_user["id"] and existing.get("username", "").lower() == new_name.lower():
-            flash("That name is already taken.", "error")
+            flash("taken", "error")
             return redirect(url_for("home"))
 
     live_user["username"] = new_name
@@ -1304,10 +1139,9 @@ def settings():
     try:
         save_db(db)
     except Exception as e:
-        flash(f"Could not save name: {e}", "error")
+        flash(str(e), "error")
         return redirect(url_for("home"))
 
-    flash("Name changed. You cannot change it again for 10 days.", "success")
     return redirect(url_for("home"))
 
 
@@ -1317,11 +1151,12 @@ def add_text():
     user = current_user()
     text = clean_text(request.form.get("text"), 800)
     color = safe_hex_color(request.form.get("color"), "#111111")
-    bg = safe_hex_color(request.form.get("bg"), "#fff8cc")
+    bg = safe_hex_color(request.form.get("bg"), "#ffffff")
     font = clamp_int(request.form.get("font"), 10, 60, 18)
+    x = clamp_int(request.form.get("x"), -10_000_000, 10_000_000, 0)
+    y = clamp_int(request.form.get("y"), -10_000_000, 10_000_000, 0)
 
     if not text:
-        flash("Text cannot be empty.", "error")
         return redirect(url_for("home"))
 
     try:
@@ -1330,18 +1165,15 @@ def add_text():
         if not ok:
             flash(msg, "error")
             return redirect(url_for("home"))
-
         ok, msg = rate_limit_user(db, user, "text", 8)
         if not ok:
             flash(msg, "error")
             return redirect(url_for("home"))
     except Exception as e:
-        flash(f"Storage error: {e}", "error")
+        flash(str(e), "error")
         return redirect(url_for("home"))
 
     item_id = secrets.token_hex(10)
-    x = secrets.randbelow(max(1, BOARD_W - 300))
-    y = secrets.randbelow(max(1, BOARD_H - 180))
 
     db["items"][item_id] = {
         "id": item_id, "type": "text", "user_id": user["id"], "username": user["username"],
@@ -1353,10 +1185,8 @@ def add_text():
     try:
         save_db(db)
     except Exception as e:
-        flash(f"Could not save text: {e}", "error")
-        return redirect(url_for("home"))
+        flash(str(e), "error")
 
-    flash("Text added.", "success")
     return redirect(url_for("home"))
 
 
@@ -1365,30 +1195,30 @@ def add_uploaded_file(kind):
     field = "image" if kind == "image" else "audio"
 
     if field not in request.files:
-        flash("No file selected.", "error")
         return redirect(url_for("home"))
 
     uploaded = request.files[field]
     if not uploaded.filename:
-        flash("No file selected.", "error")
         return redirect(url_for("home"))
 
     original_name = secure_filename(uploaded.filename)
     if kind == "image" and not allowed_image(original_name):
-        flash("Only PNG, JPG, JPEG, GIF, and WEBP images are allowed.", "error")
+        flash("bad image", "error")
         return redirect(url_for("home"))
     if kind == "audio" and not allowed_audio(original_name):
-        flash("Only MP3, WAV, OGG, and M4A audio files are allowed.", "error")
+        flash("bad audio", "error")
         return redirect(url_for("home"))
 
     file_bytes = uploaded.read()
     if not file_bytes:
-        flash("Empty file.", "error")
         return redirect(url_for("home"))
 
     if len(file_bytes) > MAX_FILE_SIZE:
-        flash(f"File too large. Max size is {file_size_text(MAX_FILE_SIZE)}.", "error")
+        flash("too large", "error")
         return redirect(url_for("home"))
+
+    x = clamp_int(request.form.get("x"), -10_000_000, 10_000_000, 0)
+    y = clamp_int(request.form.get("y"), -10_000_000, 10_000_000, 0)
 
     try:
         db = load_store(force=True)["db"]
@@ -1396,13 +1226,12 @@ def add_uploaded_file(kind):
         if not ok:
             flash(msg, "error")
             return redirect(url_for("home"))
-
         ok, msg = rate_limit_user(db, user, "upload", 25)
         if not ok:
             flash(msg, "error")
             return redirect(url_for("home"))
     except Exception as e:
-        flash(f"Storage error: {e}", "error")
+        flash(str(e), "error")
         return redirect(url_for("home"))
 
     item_id = secrets.token_hex(10)
@@ -1415,15 +1244,13 @@ def add_uploaded_file(kind):
             content_type=uploaded.content_type or "application/octet-stream",
         )
     except Exception as e:
-        flash(f"Could not upload file: {e}", "error")
+        flash(str(e), "error")
         return redirect(url_for("home"))
 
     attachments = msg.get("attachments", []) or []
     attachment = attachments[0] if attachments else {}
 
-    x = secrets.randbelow(max(1, BOARD_W - 330))
-    y = secrets.randbelow(max(1, BOARD_H - 260))
-    w, h = (300, 220) if kind == "image" else (320, 140)
+    w, h = (300, 220) if kind == "image" else (320, 80)
 
     db["items"][item_id] = {
         "id": item_id, "type": kind, "user_id": user["id"], "username": user["username"],
@@ -1438,10 +1265,8 @@ def add_uploaded_file(kind):
     try:
         save_db(db)
     except Exception as e:
-        flash(f"File uploaded, but board save failed: {e}", "error")
-        return redirect(url_for("home"))
+        flash(str(e), "error")
 
-    flash("File added.", "success")
     return redirect(url_for("home"))
 
 
@@ -1484,21 +1309,17 @@ def board_file(item_id):
     return redirect(url)
 
 
-# -----------------------------
-# API editing
-# -----------------------------
-
 def get_item_for_edit(item_id):
     store = load_store(force=True)
     db = store["db"]
     item = db["items"].get(item_id)
 
     if not item:
-        return db, None, "Item not found."
+        return db, None, "not found"
 
     user = current_user()
     if not item_can_edit(item, user):
-        return db, None, "You can only edit your own items."
+        return db, None, "not yours"
 
     return db, item, ""
 
@@ -1512,14 +1333,12 @@ def api_move_item(item_id):
 
     data = request.get_json(silent=True) or {}
     user = current_user()
-
-    # small save limit for dragging so rapid drags cannot spam snapshots
     ok, msg = rate_limit_user(db, user, "move", 1)
     if not ok:
         return jsonify({"ok": False, "error": msg}), 429
 
-    item["x"] = clamp_int(data.get("x"), 0, BOARD_W - 40, int(item.get("x", 0)))
-    item["y"] = clamp_int(data.get("y"), 0, BOARD_H - 40, int(item.get("y", 0)))
+    item["x"] = clamp_int(data.get("x"), -10_000_000, 10_000_000, int(item.get("x", 0)))
+    item["y"] = clamp_int(data.get("y"), -10_000_000, 10_000_000, int(item.get("y", 0)))
     item["w"] = clamp_int(data.get("w"), 50, 900, int(item.get("w", 220)))
     item["h"] = clamp_int(data.get("h"), 45, 700, int(item.get("h", 140)))
     item["z"] = clamp_int(data.get("z"), 1, 9999, int(item.get("z", 1)))
@@ -1542,13 +1361,13 @@ def api_edit_text(item_id):
         return jsonify({"ok": False, "error": err}), 403
 
     if item.get("type") != "text":
-        return jsonify({"ok": False, "error": "Only text items can be edited."}), 400
+        return jsonify({"ok": False, "error": "not text"}), 400
 
     data = request.get_json(silent=True) or {}
     text = clean_text(data.get("text"), 800)
 
     if not text:
-        return jsonify({"ok": False, "error": "Text cannot be empty."}), 400
+        return jsonify({"ok": False, "error": "empty"}), 400
 
     user = current_user()
     ok, msg = rate_limit_user(db, user, "edit", 5)
@@ -1597,36 +1416,35 @@ def api_add_drawing():
     points = data.get("points", [])
 
     if not isinstance(points, list) or len(points) < 2:
-        return jsonify({"ok": False, "error": "Draw something first."}), 400
+        return jsonify({"ok": False, "error": "empty"}), 400
 
     points = points[:MAX_DRAW_POINTS]
     clean_points = []
     for p in points:
         if not isinstance(p, dict):
             continue
-        x = clamp_int(p.get("x"), 0, BOARD_W, 0)
-        y = clamp_int(p.get("y"), 0, BOARD_H, 0)
+        x = clamp_int(p.get("x"), -10_000_000, 10_000_000, 0)
+        y = clamp_int(p.get("y"), -10_000_000, 10_000_000, 0)
         clean_points.append({"x": x, "y": y})
 
     if len(clean_points) < 2:
-        return jsonify({"ok": False, "error": "Not enough drawing points."}), 400
+        return jsonify({"ok": False, "error": "empty"}), 400
 
     try:
         db = load_store(force=True)["db"]
         ok, msg = item_limit_ok(db, user)
         if not ok:
             return jsonify({"ok": False, "error": msg}), 400
-
         ok, msg = rate_limit_user(db, user, "draw", 12)
         if not ok:
             return jsonify({"ok": False, "error": msg}), 429
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    min_x = max(0, min(p["x"] for p in clean_points) - 20)
-    min_y = max(0, min(p["y"] for p in clean_points) - 20)
-    max_x = min(BOARD_W, max(p["x"] for p in clean_points) + 20)
-    max_y = min(BOARD_H, max(p["y"] for p in clean_points) + 20)
+    min_x = min(p["x"] for p in clean_points) - 20
+    min_y = min(p["y"] for p in clean_points) - 20
+    max_x = max(p["x"] for p in clean_points) + 20
+    max_y = max(p["y"] for p in clean_points) + 20
     w = max(60, max_x - min_x)
     h = max(60, max_y - min_y)
 
@@ -1647,27 +1465,21 @@ def api_add_drawing():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    return jsonify({"ok": True, "reload": True})
+    return jsonify({"ok": True})
 
 
 @app.route("/cleanup")
 @login_required
 def cleanup_route():
     if not current_is_staff():
-        return "Only staff can clean old saves.", 403
-
+        return "no", 403
     result = cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=100)
-    return (
-        "Cleanup done.<br>"
-        f"Kept newest saves: {result.get('kept', 0)}<br>"
-        f"Deleted old saves: {result.get('deleted', 0)}<br>"
-        f"Total old saves found: {result.get('total', 0)}"
-    )
+    return f"deleted {result.get('deleted', 0)}"
 
 
 @app.errorhandler(413)
 def too_large(error):
-    flash(f"File too large. Maximum is {file_size_text(MAX_FILE_SIZE)}.", "error")
+    flash("too large", "error")
     return redirect(request.referrer or url_for("home"))
 
 
