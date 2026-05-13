@@ -657,12 +657,12 @@ button,input,textarea{font:inherit}
 .toolbar{position:absolute;left:6px;top:6px;display:none;gap:4px;z-index:99999;background:rgba(255,255,255,.86);padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.10)}
 .item.editable:hover .toolbar,.toolbar:hover{display:flex}
 .toolbar button{border:0;background:#111;color:#fff;font-size:11px;padding:6px 7px;cursor:pointer}
-#drawCanvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:none;z-index:9998;cursor:crosshair;pointer-events:none}
-body.draw-mode #drawCanvas{display:block;pointer-events:auto}
-#tools{position:fixed;z-index:10050;left:14px;top:50%;transform:translateY(-50%) scale(var(--ui-scale));transform-origin:left center;display:flex;flex-direction:column;gap:8px}
-.tool{width:44px;height:44px;border:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.08);font-weight:900;font-size:16px}
+#drawCanvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:none;z-index:9000;cursor:crosshair;pointer-events:none}
+body.draw-mode #drawCanvas{display:block;pointer-events:none}
+#tools{position:fixed;z-index:20000;pointer-events:auto;left:14px;top:50%;transform:translateY(-50%) scale(var(--ui-scale));transform-origin:left center;display:flex;flex-direction:column;gap:8px}
+.tool{pointer-events:auto;width:44px;height:44px;border:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.08);font-weight:900;font-size:16px}
 .tool.active{background:#111;color:#fff}
-.panel{position:fixed;z-index:10040;left:66px;top:50%;transform:translateY(-50%) scale(var(--ui-scale));transform-origin:left center;width:auto;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:8px;display:none}
+.panel{position:fixed;z-index:19990;pointer-events:auto;left:66px;top:50%;transform:translateY(-50%) scale(var(--ui-scale));transform-origin:left center;width:auto;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:8px;display:none}
 .panel.show{display:flex;gap:8px;align-items:center}
 label{display:block;font-size:11px;font-weight:800;color:#777;margin:8px 0 5px}
 input,textarea{width:100%;border:0;background:rgba(240,240,240,.75);outline:0;padding:9px}
@@ -1119,6 +1119,16 @@ window.addEventListener("keydown", e=>{
     }
 }, {capture:true});
 
+window.addEventListener("keydown", e=>{
+    if(e.key === "Escape"){
+        drawMode = false;
+        drawing = false;
+        document.body.classList.remove("draw-mode");
+        hidePanels();
+        if(canvas && ctx) ctx.clearRect(0,0,canvas.width,canvas.height);
+    }
+}, {capture:true});
+
 ["gesturestart","gesturechange","gestureend"].forEach(name=>{
     window.addEventListener(name, e=>e.preventDefault(), {passive:false});
 });
@@ -1325,6 +1335,12 @@ function resizeDrawCanvas(){
 resizeDrawCanvas();
 window.addEventListener("resize", resizeDrawCanvas);
 
+function isUiTarget(e){
+    return !!(e.target && e.target.closest(
+        "#tools,.panel,#settingsOverlay,#loginOverlay,.toolbar,button,input,textarea,select"
+    ));
+}
+
 function toggleDrawPalette(){
     setActiveTool("draw");
     const p = document.getElementById("panel-draw");
@@ -1332,6 +1348,7 @@ function toggleDrawPalette(){
     drawMode = true;
     document.body.classList.add("draw-mode");
 }
+
 function selectDrawColor(color, el){
     selectedDrawColor = color;
     document.querySelectorAll(".color-dot").forEach(x=>x.classList.remove("active"));
@@ -1342,39 +1359,70 @@ function selectDrawColor(color, el){
     drawMode = true;
     document.body.classList.add("draw-mode");
 }
+
 function drawPoint(e){
     const p=screenToWorld(e.clientX,e.clientY);
     return {x:e.clientX, y:e.clientY, realX:p.x, realY:p.y};
 }
+
 if(canvas && ctx){
-    canvas.addEventListener("mousedown",e=>{
-        if(!drawMode)return;
-        drawing=true; points=[];
+    viewport.addEventListener("mousedown", e=>{
+        if(!drawMode) return;
+        if(e.button !== 0) return;
+        if(isUiTarget(e)) return;
+
+        drawing=true;
+        points=[];
+
         const p=drawPoint(e);
         points.push({x:p.realX,y:p.realY});
+
+        ctx.clearRect(0,0,canvas.width,canvas.height);
         ctx.strokeStyle=selectedDrawColor || "#111";
         ctx.lineWidth=selectedDrawSize;
-        ctx.lineCap="round"; ctx.lineJoin="round"; ctx.beginPath(); ctx.moveTo(p.x,p.y);
+        ctx.lineCap="round";
+        ctx.lineJoin="round";
+        ctx.beginPath();
+        ctx.moveTo(p.x,p.y);
+
         e.preventDefault();
     });
-    canvas.addEventListener("mousemove",e=>{
-        if(!drawMode||!drawing)return;
+
+    document.addEventListener("mousemove", e=>{
+        if(!drawMode || !drawing) return;
+        if(isUiTarget(e)) return;
+
         const p=drawPoint(e);
         const last=points[points.length-1];
-        if(last && Math.abs(last.x-p.realX)+Math.abs(last.y-p.realY)<4)return;
+
+        if(last && Math.abs(last.x-p.realX)+Math.abs(last.y-p.realY)<4) return;
+
         points.push({x:p.realX,y:p.realY});
-        ctx.lineTo(p.x,p.y); ctx.stroke();
-    });
+        ctx.lineTo(p.x,p.y);
+        ctx.stroke();
+
+        e.preventDefault();
+    }, {passive:false});
+
     document.addEventListener("mouseup",()=>{
-        if(!drawMode||!drawing)return;
+        if(!drawMode || !drawing) return;
+
         drawing=false;
         ctx.clearRect(0,0,canvas.width,canvas.height);
-        if(points.length<2)return;
-        postJson("/api/add-drawing",{points,stroke:selectedDrawColor,stroke_width:selectedDrawSize}).then(out=>{
-            lastLoadKey=""; loadViewport();
+
+        if(points.length<2) return;
+
+        postJson("/api/add-drawing",{
+            points,
+            stroke:selectedDrawColor,
+            stroke_width:selectedDrawSize
+        }).then(out=>{
+            lastLoadKey="";
+            loadViewport();
         });
     });
 }
+
 </script>
 </body>
 </html>
