@@ -1,3 +1,13 @@
+# app.py
+# Render Start Command:
+# gunicorn app:app
+#
+# requirements.txt:
+# Flask
+# Werkzeug
+# requests
+# gunicorn
+#
 import os
 import re
 import json
