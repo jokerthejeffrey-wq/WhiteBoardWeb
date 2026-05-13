@@ -44,6 +44,9 @@ MAX_DB_SIZE = int(os.environ.get("MAX_DB_SIZE", str(7 * 1024 * 1024)))
 MAX_TOTAL_ITEMS = int(os.environ.get("MAX_TOTAL_ITEMS", "400"))
 MAX_ITEMS_PER_USER = int(os.environ.get("MAX_ITEMS_PER_USER", "100"))
 MAX_DRAW_POINTS = int(os.environ.get("MAX_DRAW_POINTS", "300"))
+MAX_TEXT_CHARS = int(os.environ.get("MAX_TEXT_CHARS", "300"))
+MAX_TEXT_W = int(os.environ.get("MAX_TEXT_W", "520"))
+MAX_TEXT_H = int(os.environ.get("MAX_TEXT_H", "360"))
 
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
 FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
@@ -513,7 +516,7 @@ def public_item(item, user=None):
         "text": item.get("text", ""),
         "color": item.get("color", "#111111"),
         "bg": item.get("bg", "#ffffff"),
-        "font": int(item.get("font", 18)),
+        "font": clamp_int(item.get("font"), 10, 36, 18),
         "stroke": item.get("stroke", "#111111"),
         "stroke_width": int(item.get("stroke_width", 4)),
         "points": item.get("points", []),
@@ -558,7 +561,7 @@ button,input,textarea{font:inherit}
 #world{position:absolute;left:0;top:0;transform-origin:0 0}
 .item{position:absolute;user-select:none;touch-action:none}
 .item.editable{cursor:move}
-.text-item{background:#fff;white-space:pre-wrap;overflow:hidden;padding:10px 12px;line-height:1.22}
+.text-item{background:#fff;white-space:pre-wrap;overflow:hidden;padding:10px 12px;line-height:1.22;border:0}
 .image-item img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
 .audio-item{background:#fff;padding:8px}
 .audio-item audio{width:100%}
@@ -572,12 +575,19 @@ body.draw-mode #drawCanvas{display:block}
 #tools{position:fixed;z-index:100;left:14px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px}
 .tool{width:44px;height:44px;border:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.08);font-weight:900;font-size:16px}
 .tool.active{background:#111;color:#fff}
-.panel{position:fixed;z-index:99;left:66px;top:50%;transform:translateY(-50%);width:260px;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:12px;display:none}
-.panel.show{display:block}
+.panel{position:fixed;z-index:99;left:66px;top:50%;transform:translateY(-50%);width:auto;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:8px;display:none}
+.panel.show{display:flex;gap:8px;align-items:center}
 label{display:block;font-size:11px;font-weight:800;color:#777;margin:8px 0 5px}
 input,textarea{width:100%;border:0;background:rgba(240,240,240,.75);outline:0;padding:9px}
 textarea{min-height:90px;resize:vertical}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.draft-text{position:absolute;width:260px;height:120px;background:#fff;border:2px dotted #111;outline:0;padding:10px 12px;line-height:1.2;font-size:18px;z-index:9997;resize:none;overflow:auto;white-space:pre-wrap;box-shadow:none}
+.draft-text:empty:before{content:"type...";color:#aaa}
+.draft-dot{position:absolute;width:9px;height:9px;background:#111;border:2px solid #fff;border-radius:50%;z-index:9999}
+.draft-dot.tl{left:-6px;top:-6px}.draft-dot.tr{right:-6px;top:-6px}.draft-dot.bl{left:-6px;bottom:-6px}.draft-dot.br{right:-6px;bottom:-6px;cursor:nwse-resize}
+.draft-done{position:absolute;right:-1px;top:-31px;border:0;background:#111;color:white;font-weight:900;padding:6px 9px;z-index:9999}
+.color-dot{width:24px;height:24px;border-radius:50%;border:2px solid rgba(0,0,0,.14);box-shadow:0 4px 14px rgba(0,0,0,.08);cursor:pointer}
+.color-dot.active{outline:3px solid #111;outline-offset:2px}
 .btn{border:0;background:#111;color:white;padding:10px 12px;font-weight:800;margin-top:8px}
 .btn2{border:0;background:#eee;color:#111;padding:10px 12px;font-weight:800;margin-top:8px}
 #loginOverlay{position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:flex;align-items:center;justify-content:center}
@@ -605,55 +615,33 @@ textarea{min-height:90px;resize:vertical}
 
 {% if user %}
 <div id="tools">
-    <button class="tool active" data-tool="text" onclick="showTool('text')">T</button>
-    <button class="tool" data-tool="image" onclick="showTool('image')">◎</button>
-    <button class="tool" data-tool="audio" onclick="showTool('audio')">♫</button>
-    <button class="tool" data-tool="draw" onclick="showTool('draw')">✎</button>
+    <button class="tool active" data-tool="text" onclick="createTextBox()">T</button>
+    <button class="tool" data-tool="image" onclick="pickImage()">◎</button>
+    <button class="tool" data-tool="audio" onclick="pickAudio()">♫</button>
+    <button class="tool" data-tool="draw" onclick="toggleDrawPalette()">✎</button>
     <button class="tool" onclick="openSettings()">⚙</button>
 </div>
 
-<div id="panel-text" class="panel show">
-    <form action="{{ url_for('add_text') }}" method="POST">
-        <input name="x" id="textX" type="hidden">
-        <input name="y" id="textY" type="hidden">
-        <label>text</label>
-        <textarea name="text" required></textarea>
-        <div class="row">
-            <div><label>text</label><input name="color" type="color" value="#111111"></div>
-            <div><label>box</label><input name="bg" type="color" value="#ffffff"></div>
-        </div>
-        <label>size</label>
-        <input name="font" type="number" value="18" min="10" max="60">
-        <button class="btn" type="submit" onclick="fillCenter('textX','textY')">add</button>
-    </form>
-</div>
+<form id="imageForm" action="{{ url_for('add_image') }}" method="POST" enctype="multipart/form-data" class="hidden">
+    <input name="x" id="imageX" type="hidden">
+    <input name="y" id="imageY" type="hidden">
+    <input id="imagePicker" name="image" type="file" accept=".png,.jpg,.jpeg,.gif,.webp">
+</form>
 
-<div id="panel-image" class="panel">
-    <form action="{{ url_for('add_image') }}" method="POST" enctype="multipart/form-data">
-        <input name="x" id="imageX" type="hidden">
-        <input name="y" id="imageY" type="hidden">
-        <label>image</label>
-        <input name="image" type="file" accept=".png,.jpg,.jpeg,.gif,.webp" required>
-        <button class="btn" type="submit" onclick="fillCenter('imageX','imageY')">upload</button>
-    </form>
-</div>
-
-<div id="panel-audio" class="panel">
-    <form action="{{ url_for('add_audio') }}" method="POST" enctype="multipart/form-data">
-        <input name="x" id="audioX" type="hidden">
-        <input name="y" id="audioY" type="hidden">
-        <label>audio</label>
-        <input name="audio" type="file" accept=".mp3,.wav,.ogg,.m4a" required>
-        <button class="btn" type="submit" onclick="fillCenter('audioX','audioY')">upload</button>
-    </form>
-</div>
+<form id="audioForm" action="{{ url_for('add_audio') }}" method="POST" enctype="multipart/form-data" class="hidden">
+    <input name="x" id="audioX" type="hidden">
+    <input name="y" id="audioY" type="hidden">
+    <input id="audioPicker" name="audio" type="file" accept=".mp3,.wav,.ogg,.m4a">
+</form>
 
 <div id="panel-draw" class="panel">
-    <div class="row">
-        <div><label>color</label><input id="drawColor" type="color" value="#111111"></div>
-        <div><label>size</label><input id="drawSize" type="number" value="4" min="1" max="30"></div>
-    </div>
-    <button id="drawToggle" class="btn" onclick="toggleDraw()">start</button>
+    <button class="color-dot active" style="background:#111111" onclick="selectDrawColor('#111111', this)"></button>
+    <button class="color-dot" style="background:#ff3b30" onclick="selectDrawColor('#ff3b30', this)"></button>
+    <button class="color-dot" style="background:#ff9500" onclick="selectDrawColor('#ff9500', this)"></button>
+    <button class="color-dot" style="background:#ffcc00" onclick="selectDrawColor('#ffcc00', this)"></button>
+    <button class="color-dot" style="background:#34c759" onclick="selectDrawColor('#34c759', this)"></button>
+    <button class="color-dot" style="background:#007aff" onclick="selectDrawColor('#007aff', this)"></button>
+    <button class="color-dot" style="background:#af52de" onclick="selectDrawColor('#af52de', this)"></button>
 </div>
 
 <div id="settingsOverlay">
@@ -713,6 +701,156 @@ function fillCenter(xid,yid){
     if(x) x.value = p.x;
     if(y) y.value = p.y;
 }
+
+function pickImage(){
+    setActiveTool("image");
+    hidePanels();
+    fillCenter("imageX","imageY");
+    document.getElementById("imagePicker").click();
+}
+function pickAudio(){
+    setActiveTool("audio");
+    hidePanels();
+    fillCenter("audioX","audioY");
+    document.getElementById("audioPicker").click();
+}
+document.addEventListener("change", e=>{
+    if(e.target && e.target.id === "imagePicker" && e.target.files.length){
+        document.getElementById("imageForm").submit();
+    }
+    if(e.target && e.target.id === "audioPicker" && e.target.files.length){
+        document.getElementById("audioForm").submit();
+    }
+});
+
+let draftBox = null;
+let draftSaveLock = false;
+
+function createTextBox(){
+    setActiveTool("text");
+    hidePanels();
+    if(draftBox) return;
+
+    const p = centerWorld();
+    const box = document.createElement("div");
+    box.className = "draft-text";
+    box.contentEditable = "true";
+    box.style.left = p.x + "px";
+    box.style.top = p.y + "px";
+    box.style.width = "260px";
+    box.style.height = "120px";
+
+    const done = document.createElement("button");
+    done.className = "draft-done";
+    done.textContent = "✓";
+    done.contentEditable = "false";
+    done.onclick = e => { e.stopPropagation(); saveDraftText(); };
+
+    ["tl","tr","bl","br"].forEach(pos=>{
+        const d = document.createElement("span");
+        d.className = "draft-dot " + pos;
+        d.contentEditable = "false";
+        if(pos === "br"){
+            d.addEventListener("mousedown", startDraftResize);
+        }
+        box.appendChild(d);
+    });
+
+    box.appendChild(done);
+    world.appendChild(box);
+    draftBox = box;
+    box.focus();
+
+    box.addEventListener("input", ()=>{
+        let txt = box.innerText.replace("✓", "").trim();
+        if(txt.length > 300){
+            box.innerText = txt.slice(0,300);
+            placeCaretEnd(box);
+        }
+    });
+
+    box.addEventListener("keydown", e=>{
+        if(e.key === "Enter" && (e.ctrlKey || e.metaKey)){
+            e.preventDefault();
+            saveDraftText();
+        }
+        if(e.key === "Escape"){
+            e.preventDefault();
+            cancelDraftText();
+        }
+    });
+}
+
+function placeCaretEnd(el){
+    const range = document.createRange();
+    const sel = window.getSelection();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+}
+
+function draftCleanText(){
+    if(!draftBox) return "";
+    let copy = draftBox.cloneNode(true);
+    copy.querySelectorAll(".draft-dot,.draft-done").forEach(x=>x.remove());
+    return copy.innerText.trim().slice(0,300);
+}
+
+function cancelDraftText(){
+    if(draftBox){ draftBox.remove(); draftBox = null; }
+}
+
+async function saveDraftText(){
+    if(!draftBox || draftSaveLock) return;
+    const txt = draftCleanText();
+    if(!txt){ cancelDraftText(); return; }
+
+    draftSaveLock = true;
+    const data = {
+        text: txt,
+        x: parseInt(draftBox.style.left || "0"),
+        y: parseInt(draftBox.style.top || "0"),
+        w: Math.max(80, Math.min(520, Math.round(draftBox.offsetWidth))),
+        h: Math.max(50, Math.min(360, Math.round(draftBox.offsetHeight)))
+    };
+
+    const out = await postJson("/api/add-text-box", data);
+    if(out && out.ok){
+        cancelDraftText();
+        lastLoadKey = "";
+        loadViewport();
+    }
+    draftSaveLock = false;
+}
+
+let draftResize = null;
+function startDraftResize(e){
+    if(!draftBox) return;
+    e.preventDefault();
+    e.stopPropagation();
+    draftResize = {
+        x:e.clientX,
+        y:e.clientY,
+        w:draftBox.offsetWidth,
+        h:draftBox.offsetHeight
+    };
+}
+document.addEventListener("mousemove", e=>{
+    if(!draftResize || !draftBox) return;
+    const w = Math.max(80, Math.min(520, draftResize.w + (e.clientX - draftResize.x)));
+    const h = Math.max(50, Math.min(360, draftResize.h + (e.clientY - draftResize.y)));
+    draftBox.style.width = w + "px";
+    draftBox.style.height = h + "px";
+});
+document.addEventListener("mouseup", ()=>{
+    draftResize = null;
+});
+document.addEventListener("mousedown", e=>{
+    if(draftBox && !draftBox.contains(e.target) && !e.target.closest("#tools")){
+        saveDraftText();
+    }
+}, true);
 function applyCamera(){
     world.style.transform = `translate(${camera.x}px, ${camera.y}px)`;
     localStorage.camX = camera.x;
@@ -721,13 +859,13 @@ function applyCamera(){
 }
 applyCamera();
 
-function showTool(name){
-    document.querySelectorAll(".panel").forEach(x=>x.classList.remove("show"));
+function setActiveTool(name){
     document.querySelectorAll(".tool").forEach(x=>x.classList.remove("active"));
-    const p = document.getElementById("panel-"+name);
     const b = document.querySelector(`[data-tool="${name}"]`);
-    if(p) p.classList.add("show");
     if(b) b.classList.add("active");
+}
+function hidePanels(){
+    document.querySelectorAll(".panel").forEach(x=>x.classList.remove("show"));
 }
 function showAuth(which){
     document.getElementById("registerBox").classList.toggle("hidden", which !== "register");
@@ -914,14 +1052,24 @@ function bindDragging(){
 
 // drawing
 let drawMode=false, drawing=false, points=[];
+let selectedDrawColor = "#111111";
+let selectedDrawSize = 4;
 const canvas=document.getElementById("drawCanvas");
 const ctx=canvas ? canvas.getContext("2d") : null;
 
-function toggleDraw(){
-    drawMode=!drawMode;
-    document.body.classList.toggle("draw-mode",drawMode);
-    const b=document.getElementById("drawToggle");
-    if(b)b.textContent=drawMode?"stop":"start";
+function toggleDrawPalette(){
+    setActiveTool("draw");
+    const p = document.getElementById("panel-draw");
+    if(p) p.classList.toggle("show");
+    drawMode = true;
+    document.body.classList.add("draw-mode");
+}
+function selectDrawColor(color, el){
+    selectedDrawColor = color;
+    document.querySelectorAll(".color-dot").forEach(x=>x.classList.remove("active"));
+    if(el) el.classList.add("active");
+    drawMode = true;
+    document.body.classList.add("draw-mode");
 }
 function drawPoint(e){
     const p=screenToWorld(e.clientX,e.clientY);
@@ -933,8 +1081,8 @@ if(canvas && ctx){
         drawing=true; points=[];
         const p=drawPoint(e);
         points.push({x:p.realX,y:p.realY});
-        ctx.strokeStyle=document.getElementById("drawColor").value||"#111";
-        ctx.lineWidth=Math.max(1,Math.min(30,parseInt(document.getElementById("drawSize").value||"4")));
+        ctx.strokeStyle=selectedDrawColor || "#111";
+        ctx.lineWidth=selectedDrawSize;
         ctx.lineCap="round"; ctx.lineJoin="round"; ctx.beginPath(); ctx.moveTo(p.x,p.y);
         e.preventDefault();
     });
@@ -951,7 +1099,7 @@ if(canvas && ctx){
         drawing=false;
         ctx.clearRect(0,0,canvas.width,canvas.height);
         if(points.length<2)return;
-        postJson("/api/add-drawing",{points,stroke:document.getElementById("drawColor").value,stroke_width:parseInt(document.getElementById("drawSize").value||"4")}).then(out=>{
+        postJson("/api/add-drawing",{points,stroke:selectedDrawColor,stroke_width:selectedDrawSize}).then(out=>{
             lastLoadKey=""; loadViewport();
         });
     });
@@ -1145,14 +1293,68 @@ def settings():
     return redirect(url_for("home"))
 
 
+
+@app.route("/api/add-text-box", methods=["POST"])
+@login_required
+def api_add_text_box():
+    user = current_user()
+    data = request.get_json(silent=True) or {}
+
+    text = clean_text(data.get("text"), MAX_TEXT_CHARS)
+    x = clamp_int(data.get("x"), -10_000_000, 10_000_000, 0)
+    y = clamp_int(data.get("y"), -10_000_000, 10_000_000, 0)
+    w = clamp_int(data.get("w"), 80, MAX_TEXT_W, 260)
+    h = clamp_int(data.get("h"), 50, MAX_TEXT_H, 120)
+
+    if not text:
+        return jsonify({"ok": False, "error": "empty"}), 400
+
+    try:
+        db = load_store(force=True)["db"]
+        ok, msg = item_limit_ok(db, user)
+        if not ok:
+            return jsonify({"ok": False, "error": msg}), 400
+        ok, msg = rate_limit_user(db, user, "text", 8)
+        if not ok:
+            return jsonify({"ok": False, "error": msg}), 429
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    item_id = secrets.token_hex(10)
+    db["items"][item_id] = {
+        "id": item_id,
+        "type": "text",
+        "user_id": user["id"],
+        "username": user["username"],
+        "x": x,
+        "y": y,
+        "w": w,
+        "h": h,
+        "z": int(time.time()) % 9000 + 1,
+        "text": text,
+        "color": "#111111",
+        "bg": "#ffffff",
+        "font": 18,
+        "created": int(time.time()),
+        "updated": int(time.time()),
+    }
+
+    try:
+        save_db(db)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": True, "id": item_id})
+
+
 @app.route("/add-text", methods=["POST"])
 @login_required
 def add_text():
     user = current_user()
-    text = clean_text(request.form.get("text"), 800)
+    text = clean_text(request.form.get("text"), MAX_TEXT_CHARS)
     color = safe_hex_color(request.form.get("color"), "#111111")
     bg = safe_hex_color(request.form.get("bg"), "#ffffff")
-    font = clamp_int(request.form.get("font"), 10, 60, 18)
+    font = clamp_int(request.form.get("font"), 10, 36, 18)
     x = clamp_int(request.form.get("x"), -10_000_000, 10_000_000, 0)
     y = clamp_int(request.form.get("y"), -10_000_000, 10_000_000, 0)
 
