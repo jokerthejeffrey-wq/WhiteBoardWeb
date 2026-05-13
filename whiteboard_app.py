@@ -801,7 +801,7 @@ function cancelDraftText(){
     if(draftBox){ draftBox.remove(); draftBox = null; }
 }
 
-async async function saveDraftText(){
+async function saveDraftText(){
     if(!draftBox || draftSaveLock) return;
     const txt = draftCleanText();
     if(!txt){ cancelDraftText(); return; }
