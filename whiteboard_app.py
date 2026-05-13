@@ -734,12 +734,62 @@ function pickAudio(){
 }
 document.addEventListener("change", e=>{
     if(e.target && e.target.id === "imagePicker" && e.target.files.length){
-        document.getElementById("imageForm").submit();
+        uploadPickedFile("image");
     }
     if(e.target && e.target.id === "audioPicker" && e.target.files.length){
-        document.getElementById("audioForm").submit();
+        uploadPickedFile("audio");
     }
 });
+
+async function uploadPickedFile(kind){
+    const isImage = kind === "image";
+    const picker = document.getElementById(isImage ? "imagePicker" : "audioPicker");
+    const xInput = document.getElementById(isImage ? "imageX" : "audioX");
+    const yInput = document.getElementById(isImage ? "imageY" : "audioY");
+
+    if(!picker || !picker.files || !picker.files.length) return;
+
+    const p = centerWorld();
+    if(xInput) xInput.value = p.x;
+    if(yInput) yInput.value = p.y;
+
+    const form = new FormData();
+    form.append(isImage ? "image" : "audio", picker.files[0]);
+    form.append("x", p.x);
+    form.append("y", p.y);
+
+    picker.value = "";
+
+    try{
+        const res = await fetch(isImage ? "/api/add-image" : "/api/add-audio", {
+            method: "POST",
+            body: form
+        });
+
+        let out = {};
+        try{ out = await res.json(); }catch(e){}
+
+        if(!res.ok || out.ok === false){
+            alert(out.error || "upload failed");
+            return;
+        }
+
+        if(out.item && !loaded.has(out.item.id)){
+            loaded.set(out.item.id, out.item);
+            world.insertAdjacentHTML("beforeend", itemHtml(out.item));
+            const el = document.getElementById("item-" + out.item.id);
+            if(el && out.item.type === "text"){
+                el.querySelector("[data-text-body]").textContent = out.item.text || "";
+            }
+            bindDragging();
+        }
+
+        lastLoadKey = "";
+        setTimeout(loadViewport, 250);
+    }catch(err){
+        alert("upload failed");
+    }
+}
 
 let draftBox = null;
 let draftSaveLock = false;
@@ -942,7 +992,7 @@ function itemHtml(item){
         style += `background:${item.bg};color:${item.color};font-size:${item.font}px;`;
         html = `<div id="item-${item.id}" class="item text-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<div data-text-body></div><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }else if(item.type === "image"){
-        html = `<div id="item-${item.id}" class="item image-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<img src="${item.file_url}" onerror="this.style.display=\'none\'; this.parentElement.insertAdjacentHTML(\'beforeend\', \'<div style=&quot;font-size:12px;color:#999;padding:8px&quot;>image loading failed</div>\')"><div class="tag">@${escapeHtml(item.username)}</div></div>`;
+        html = `<div id="item-${item.id}" class="item image-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<img src="${item.file_url}?v=${item.created || Date.now()}" onload="this.dataset.ok='1'" onerror="this.style.display='none'; this.parentElement.insertAdjacentHTML('beforeend', '<div style=&quot;font-size:12px;color:#999;padding:8px&quot;>image loading failed</div>')"><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }else if(item.type === "audio"){
         html = `<div id="item-${item.id}" class="item audio-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<audio controls preload="none" src="${item.file_url}"></audio><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }else{
@@ -989,7 +1039,19 @@ async function loadViewport(){
         const data = await res.json();
         if(data.ok){
             data.items.forEach(item=>{
-                if(loaded.has(item.id)) return;
+                if(loaded.has(item.id)){
+                    loaded.set(item.id, item);
+                    const oldEl = document.getElementById("item-" + item.id);
+                    if(oldEl){
+                        oldEl.style.left = item.x + "px";
+                        oldEl.style.top = item.y + "px";
+                        oldEl.style.width = item.w + "px";
+                        oldEl.style.height = item.h + "px";
+                        oldEl.style.zIndex = item.z;
+                    }
+                    return;
+                }
+
                 loaded.set(item.id,item);
                 world.insertAdjacentHTML("beforeend", itemHtml(item));
                 const el = document.getElementById("item-"+item.id);
@@ -1422,32 +1484,38 @@ def add_text():
     return redirect(url_for("home"))
 
 
-def add_uploaded_file(kind):
+def add_uploaded_file(kind, api=False):
     user = current_user()
     field = "image" if kind == "image" else "audio"
 
-    if field not in request.files:
+    def fail(message, status=400):
+        if api:
+            return jsonify({"ok": False, "error": message}), status
+        flash(message, "error")
         return redirect(url_for("home"))
+
+    if field not in request.files:
+        return fail("no file selected")
 
     uploaded = request.files[field]
     if not uploaded.filename:
-        return redirect(url_for("home"))
+        return fail("no file selected")
 
     original_name = secure_filename(uploaded.filename)
+
     if kind == "image" and not allowed_image(original_name):
-        flash("bad image", "error")
-        return redirect(url_for("home"))
+        return fail("bad image type")
+
     if kind == "audio" and not allowed_audio(original_name):
-        flash("bad audio", "error")
-        return redirect(url_for("home"))
+        return fail("bad audio type")
 
     file_bytes = uploaded.read()
+
     if not file_bytes:
-        return redirect(url_for("home"))
+        return fail("empty file")
 
     if len(file_bytes) > MAX_FILE_SIZE:
-        flash("too large", "error")
-        return redirect(url_for("home"))
+        return fail("file too large")
 
     x = clamp_int(request.form.get("x"), -10_000_000, 10_000_000, 0)
     y = clamp_int(request.form.get("y"), -10_000_000, 10_000_000, 0)
@@ -1456,15 +1524,13 @@ def add_uploaded_file(kind):
         db = load_store(force=True)["db"]
         ok, msg = item_limit_ok(db, user)
         if not ok:
-            flash(msg, "error")
-            return redirect(url_for("home"))
-        ok, msg = rate_limit_user(db, user, "upload", 25)
+            return fail(msg)
+
+        ok, msg = rate_limit_user(db, user, "upload", 8 if api else 25)
         if not ok:
-            flash(msg, "error")
-            return redirect(url_for("home"))
+            return fail(msg, 429)
     except Exception as e:
-        flash(str(e), "error")
-        return redirect(url_for("home"))
+        return fail(str(e), 500)
 
     item_id = secrets.token_hex(10)
 
@@ -1473,11 +1539,10 @@ def add_uploaded_file(kind):
             content=f"WBFILE|{kind}|{item_id}",
             filename=original_name,
             file_bytes=file_bytes,
-            content_type=uploaded.content_type or "application/octet-stream",
+            content_type=uploaded.content_type or guess_content_type(original_name),
         )
     except Exception as e:
-        flash(str(e), "error")
-        return redirect(url_for("home"))
+        return fail(str(e), 500)
 
     attachments = msg.get("attachments", []) or []
     attachment = attachments[0] if attachments else {}
@@ -1485,19 +1550,35 @@ def add_uploaded_file(kind):
     w, h = (300, 220) if kind == "image" else (320, 80)
 
     db["items"][item_id] = {
-        "id": item_id, "type": kind, "user_id": user["id"], "username": user["username"],
-        "x": x, "y": y, "w": w, "h": h, "z": int(time.time()) % 9000 + 1,
-        "filename": original_name, "size": len(file_bytes),
+        "id": item_id,
+        "type": kind,
+        "user_id": user["id"],
+        "username": user["username"],
+        "x": x,
+        "y": y,
+        "w": w,
+        "h": h,
+        "z": int(time.time()) % 9000 + 1,
+        "filename": original_name,
+        "size": len(file_bytes),
         "file_message_id": msg.get("id", ""),
         "file_url": attachment.get("url", ""),
         "file_proxy_url": attachment.get("proxy_url", ""),
-        "created": int(time.time()), "updated": int(time.time()),
+        "created": int(time.time()),
+        "updated": int(time.time()),
     }
 
     try:
         save_db(db)
     except Exception as e:
-        flash(str(e), "error")
+        return fail(str(e), 500)
+
+    if api:
+        return jsonify({
+            "ok": True,
+            "id": item_id,
+            "item": public_item(db["items"][item_id], user),
+        })
 
     return redirect(url_for("home"))
 
@@ -1505,13 +1586,25 @@ def add_uploaded_file(kind):
 @app.route("/add-image", methods=["POST"])
 @login_required
 def add_image():
-    return add_uploaded_file("image")
+    return add_uploaded_file("image", api=False)
 
 
 @app.route("/add-audio", methods=["POST"])
 @login_required
 def add_audio():
-    return add_uploaded_file("audio")
+    return add_uploaded_file("audio", api=False)
+
+
+@app.route("/api/add-image", methods=["POST"])
+@login_required
+def api_add_image():
+    return add_uploaded_file("image", api=True)
+
+
+@app.route("/api/add-audio", methods=["POST"])
+@login_required
+def api_add_audio():
+    return add_uploaded_file("audio", api=True)
 
 
 @app.route("/board-file/<item_id>")
