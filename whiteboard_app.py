@@ -45,8 +45,8 @@ MAX_TOTAL_ITEMS = int(os.environ.get("MAX_TOTAL_ITEMS", "400"))
 MAX_ITEMS_PER_USER = int(os.environ.get("MAX_ITEMS_PER_USER", "100"))
 MAX_DRAW_POINTS = int(os.environ.get("MAX_DRAW_POINTS", "300"))
 MAX_TEXT_CHARS = int(os.environ.get("MAX_TEXT_CHARS", "300"))
-MAX_TEXT_W = int(os.environ.get("MAX_TEXT_W", "520"))
-MAX_TEXT_H = int(os.environ.get("MAX_TEXT_H", "360"))
+MAX_TEXT_W = int(os.environ.get("MAX_TEXT_W", "420"))
+MAX_TEXT_H = int(os.environ.get("MAX_TEXT_H", "260"))
 
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
 FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
@@ -557,7 +557,7 @@ HTML = """
 *{box-sizing:border-box}
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif}
 button,input,textarea{font:inherit}
-#viewport{position:fixed;inset:0;overflow:hidden;background:#fff;cursor:default}
+#viewport{position:fixed;inset:0;overflow:hidden;background-color:#fff;background-image:linear-gradient(rgba(0,0,0,.055) 1px, transparent 1px),linear-gradient(90deg, rgba(0,0,0,.055) 1px, transparent 1px);background-size:42px 42px;cursor:default}
 #world{position:absolute;left:0;top:0;transform-origin:0 0}
 .item{position:absolute;user-select:none;touch-action:none}
 .item.editable{cursor:move}
@@ -801,7 +801,7 @@ function cancelDraftText(){
     if(draftBox){ draftBox.remove(); draftBox = null; }
 }
 
-async function saveDraftText(){
+async async function saveDraftText(){
     if(!draftBox || draftSaveLock) return;
     const txt = draftCleanText();
     if(!txt){ cancelDraftText(); return; }
@@ -811,15 +811,26 @@ async function saveDraftText(){
         text: txt,
         x: parseInt(draftBox.style.left || "0"),
         y: parseInt(draftBox.style.top || "0"),
-        w: Math.max(80, Math.min(520, Math.round(draftBox.offsetWidth))),
-        h: Math.max(50, Math.min(360, Math.round(draftBox.offsetHeight)))
+        w: Math.max(80, Math.min(420, Math.round(draftBox.offsetWidth))),
+        h: Math.max(50, Math.min(260, Math.round(draftBox.offsetHeight)))
     };
 
     const out = await postJson("/api/add-text-box", data);
     if(out && out.ok){
         cancelDraftText();
+
+        if(out.item && !loaded.has(out.item.id)){
+            loaded.set(out.item.id, out.item);
+            world.insertAdjacentHTML("beforeend", itemHtml(out.item));
+            const el = document.getElementById("item-" + out.item.id);
+            if(el && out.item.type === "text"){
+                el.querySelector("[data-text-body]").textContent = out.item.text || "";
+            }
+            bindDragging();
+        }
+
         lastLoadKey = "";
-        loadViewport();
+        setTimeout(loadViewport, 250);
     }
     draftSaveLock = false;
 }
@@ -838,8 +849,8 @@ function startDraftResize(e){
 }
 document.addEventListener("mousemove", e=>{
     if(!draftResize || !draftBox) return;
-    const w = Math.max(80, Math.min(520, draftResize.w + (e.clientX - draftResize.x)));
-    const h = Math.max(50, Math.min(360, draftResize.h + (e.clientY - draftResize.y)));
+    const w = Math.max(80, Math.min(420, draftResize.w + (e.clientX - draftResize.x)));
+    const h = Math.max(50, Math.min(260, draftResize.h + (e.clientY - draftResize.y)));
     draftBox.style.width = w + "px";
     draftBox.style.height = h + "px";
 });
@@ -853,6 +864,7 @@ document.addEventListener("mousedown", e=>{
 }, true);
 function applyCamera(){
     world.style.transform = `translate(${camera.x}px, ${camera.y}px)`;
+    viewport.style.backgroundPosition = `${camera.x}px ${camera.y}px`;
     localStorage.camX = camera.x;
     localStorage.camY = camera.y;
     scheduleLoad();
@@ -1344,7 +1356,7 @@ def api_add_text_box():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    return jsonify({"ok": True, "id": item_id})
+    return jsonify({"ok": True, "id": item_id, "item": public_item(db["items"][item_id], user)})
 
 
 @app.route("/add-text", methods=["POST"])
