@@ -53,7 +53,7 @@ CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
 FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
 DB_SNAPSHOT_KEEP = max(1, int(os.environ.get("DB_SNAPSHOT_KEEP", "1")))
 DB_SNAPSHOT_DELETE_LIMIT = max(1, int(os.environ.get("DB_SNAPSHOT_DELETE_LIMIT", "25")))
-AUTO_DELETE_OLD_SNAPSHOTS = os.environ.get("AUTO_DELETE_OLD_SNAPSHOTS", "0").strip().lower() not in {"0", "false", "no", "off"}
+AUTO_DELETE_OLD_SNAPSHOTS = os.environ.get("AUTO_DELETE_OLD_SNAPSHOTS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 NAME_CHANGE_COOLDOWN_SECONDS = int(os.environ.get("NAME_CHANGE_COOLDOWN_SECONDS", str(10 * 24 * 60 * 60)))
 
@@ -514,23 +514,42 @@ def save_db(db):
     db = normalize_db(db)
     db["updated_at"] = now_ms()
 
+    # Get the last DB snapshot id BEFORE posting the new one.
+    # load_store(force=True) is called before saves, so this is normally available.
+    old_snapshot_id = ""
+    try:
+        if CACHE.get("store"):
+            old_snapshot_id = CACHE["store"].get("latest_snapshot_id", "") or ""
+    except Exception:
+        old_snapshot_id = ""
+
     raw_json = json.dumps(db, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     raw = gzip.compress(raw_json, compresslevel=6)
 
     if len(raw) > MAX_DB_SIZE:
         raise ValueError("board data too large")
 
-    post_attachment(
+    msg = post_attachment(
         content=f"WBDBSNAP|v4|gz|{int(time.time())}",
         filename="whiteboard-db.json.gz",
         file_bytes=raw,
         content_type="application/gzip",
     )
 
-    # Old stable behavior: just save and refresh cache.
-    # No auto scanning/deleting old DB messages during user actions.
-    # This prevents Render from freezing.
+    new_snapshot_id = msg.get("id", "")
+
+    # Clear cache so the next page/API call loads the newest DB.
     clear_cache()
+
+    # IMPORTANT:
+    # Delete only the previous DB snapshot message.
+    # Do NOT scan/delete many Discord messages during normal user actions,
+    # because that can freeze a free Render worker.
+    # Uploaded image/audio messages are NOT deleted.
+    if old_snapshot_id and old_snapshot_id != new_snapshot_id:
+        delete_message_background(old_snapshot_id)
+
+    return new_snapshot_id
 
 
 def cache_attachment(kind, key, info):
@@ -2192,8 +2211,25 @@ def api_debug_item(item_id):
 def cleanup_route():
     if not current_is_staff():
         return "no", 403
-    result = cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=100, max_pages=12)
-    return f"deleted {result.get('deleted', 0)}"
+
+    # Manual cleanup for old backlog.
+    # Use this once if your Discord channel already has too many old WBDBSNAP messages.
+    # It keeps the newest DB snapshot and deletes old DB snapshots only.
+    # It never deletes WBFILE image/audio messages.
+    result = cleanup_old_snapshots(keep=1, delete_limit=250, max_pages=20)
+    return (
+        f"database cleanup done<br>"
+        f"deleted old db snapshots: {result.get('deleted', 0)}<br>"
+        f"kept newest db snapshots: {result.get('kept', 0)}<br>"
+        f"found db snapshots: {result.get('total', 0)}<br>"
+        f"<br>New uploads/edits will now delete the previous DB snapshot automatically."
+    )
+
+
+@app.route("/cleanup-db")
+@login_required
+def cleanup_db_route():
+    return cleanup_route()
 
 
 @app.errorhandler(413)
