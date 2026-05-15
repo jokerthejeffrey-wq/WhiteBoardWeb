@@ -538,10 +538,17 @@ def save_db(db):
 
     new_snapshot_id = msg.get("id", "")
 
-    # Clear cache so the next page/API call loads the newest DB.
-    clear_cache()
+    # Keep the just-saved DB in local cache immediately.
+    # This fixes the bug where a new user could create an account but the next page
+    # still loaded the old DB for a few seconds and showed the login screen again.
+    CACHE["time"] = time.time()
+    CACHE["store"] = {
+        "db": normalize_db(db),
+        "snapshot_loaded": True,
+        "message_count": 1,
+        "latest_snapshot_id": new_snapshot_id,
+    }
 
-    # IMPORTANT:
     # Delete only the previous DB snapshot message.
     # Do NOT scan/delete many Discord messages during normal user actions,
     # because that can freeze a free Render worker.
@@ -817,13 +824,13 @@ textarea{min-height:90px;resize:vertical}
             <br><br>
             <input name="email" type="email" placeholder="email" required>
             <br><br>
-            <input name="password" type="password" placeholder="password" required>
+            <input name="password" type="password" placeholder="password" required minlength="6">
             <button class="btn" type="submit">create</button>
             <button class="btn2" type="button" onclick="showAuth('login')">login</button>
         </form>
 
         <form id="loginBoxForm" class="hidden" action="{{ url_for('login') }}" method="POST">
-            <input name="email_or_user" placeholder="email or name" required>
+            <input name="email_or_user" placeholder="email or username" required>
             <br><br>
             <input name="password" type="password" placeholder="password" required>
             <button class="btn" type="submit">login</button>
@@ -1783,6 +1790,56 @@ def api_items():
         return jsonify({"ok": False, "error": str(e), "items": []}), 500
 
 
+def find_user_by_email_or_username(db, value):
+    value = clean_text(value, 120)
+    email_value = normalize_email(value)
+    name_value = value.lower()
+
+    for uid, user in db.get("users", {}).items():
+        if not user.get("id"):
+            user["id"] = uid
+
+        if normalize_email(user.get("email")) == email_value:
+            return uid, user
+
+        if user.get("username", "").lower() == name_value:
+            return uid, user
+
+    return "", None
+
+
+def user_has_items(db, user_id):
+    for item in db.get("items", {}).values():
+        if item.get("user_id") == user_id:
+            return True
+    return False
+
+
+def remove_empty_ghost_users(db, email, username, keep_uid=""):
+    """
+    Removes old broken rows only when they have no password and no items.
+    This fixes old failed/guest registrations that reserved an email/name.
+    Real accounts and accounts with board items are not removed.
+    """
+    email = normalize_email(email)
+    username_l = (username or "").strip().lower()
+    removed = 0
+
+    for uid, user in list(db.get("users", {}).items()):
+        if uid == keep_uid:
+            continue
+
+        same_email = email and normalize_email(user.get("email")) == email
+        same_name = username_l and user.get("username", "").strip().lower() == username_l
+        has_password = bool(user.get("password_hash"))
+
+        if (same_email or same_name) and not has_password and not user_has_items(db, uid):
+            db["users"].pop(uid, None)
+            removed += 1
+
+    return removed
+
+
 @app.route("/register", methods=["POST"])
 def register():
     if current_user():
@@ -1792,8 +1849,10 @@ def register():
     email = normalize_email(request.form.get("email"))
     password = request.form.get("password", "")
 
+    # IMPORTANT: no database is loaded or saved until all form validation passes.
+    # So a bad name / bad email / short password can never reserve the email.
     if not valid_username(username):
-        flash("bad name", "error")
+        flash("name must be 3-24 letters/numbers/._-", "error")
         return redirect(url_for("home"))
 
     if not EMAIL_REGEX.fullmatch(email):
@@ -1812,26 +1871,48 @@ def register():
 
     uid = user_id_from_email(email)
 
-    for existing_id, existing in db["users"].items():
-        if normalize_email(existing.get("email")) == email and existing_id != uid:
-            flash("email exists", "error")
-            return redirect(url_for("home"))
-        if existing.get("username", "").lower() == username.lower() and existing_id != uid:
-            flash("name exists", "error")
+    # Clean old broken placeholder rows from earlier buggy versions.
+    remove_empty_ghost_users(db, email, username, keep_uid=uid)
+
+    existing_same_email = db["users"].get(uid)
+
+    if existing_same_email:
+        # If the account already exists and the password is correct, log them in.
+        # This fixes the "created but not logged in first try, then account exists" problem.
+        old_hash = existing_same_email.get("password_hash", "")
+
+        if old_hash and check_password_hash(old_hash, password):
+            session.clear()
+            session["email"] = normalize_email(existing_same_email.get("email", email))
+            session["user_id"] = existing_same_email.get("id", uid) or uid
             return redirect(url_for("home"))
 
-    if uid in db["users"]:
-        flash("account exists", "error")
-        return redirect(url_for("home"))
+        # If this is a broken old row without a password and no items, repair it.
+        if not old_hash and not user_has_items(db, uid):
+            pass
+        else:
+            flash("email already exists, use login", "error")
+            return redirect(url_for("home"))
+
+    # Do not let two real users have the same username.
+    for existing_id, existing in db["users"].items():
+        if existing_id == uid:
+            continue
+        if existing.get("username", "").lower() == username.lower():
+            flash("name exists", "error")
+            return redirect(url_for("home"))
+        if normalize_email(existing.get("email")) == email:
+            flash("email exists", "error")
+            return redirect(url_for("home"))
 
     db["users"][uid] = {
         "id": uid,
         "username": username,
         "email": email,
         "password_hash": generate_password_hash(password),
-        "created": int(time.time()),
-        "name_changed_at": int(time.time()),
-        "cooldowns": {},
+        "created": int(existing_same_email.get("created", time.time())) if isinstance(existing_same_email, dict) else int(time.time()),
+        "name_changed_at": int(existing_same_email.get("name_changed_at", time.time())) if isinstance(existing_same_email, dict) else int(time.time()),
+        "cooldowns": existing_same_email.get("cooldowns", {}) if isinstance(existing_same_email, dict) else {},
     }
 
     try:
@@ -1840,6 +1921,7 @@ def register():
         flash(str(e), "error")
         return redirect(url_for("home"))
 
+    session.clear()
     session["email"] = email
     session["user_id"] = uid
     return redirect(url_for("home"))
@@ -1853,24 +1935,43 @@ def login():
     email_or_user = clean_text(request.form.get("email_or_user"), 120)
     password = request.form.get("password", "")
 
+    if not email_or_user or not password:
+        flash("wrong login", "error")
+        return redirect(url_for("home"))
+
     try:
         db = load_store(force=True)["db"]
     except Exception as e:
         flash(str(e), "error")
         return redirect(url_for("home"))
 
-    found = None
-    for user in db["users"].values():
-        if normalize_email(user.get("email")) == normalize_email(email_or_user) or user.get("username", "").lower() == email_or_user.lower():
-            found = user
-            break
+    found_uid, found = find_user_by_email_or_username(db, email_or_user)
 
-    if not found or not check_password_hash(found.get("password_hash", ""), password):
+    if not found:
         flash("wrong login", "error")
         return redirect(url_for("home"))
 
-    session["email"] = found.get("email", "")
-    session["user_id"] = found.get("id", "")
+    password_hash = found.get("password_hash", "")
+
+    if not password_hash:
+        flash("this account has no password, create it again", "error")
+        return redirect(url_for("home"))
+
+    try:
+        ok = check_password_hash(password_hash, password)
+    except Exception:
+        ok = False
+
+    if not ok:
+        flash("wrong login", "error")
+        return redirect(url_for("home"))
+
+    if not found.get("id"):
+        found["id"] = found_uid
+
+    session.clear()
+    session["email"] = normalize_email(found.get("email", ""))
+    session["user_id"] = found.get("id", found_uid)
     return redirect(url_for("home"))
 
 
