@@ -661,9 +661,9 @@ HTML = """
 <style>
 *{box-sizing:border-box}
 :root{--ui-scale:1;--grid-size:42px}
-html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif;touch-action:none}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif;touch-action:none;overscroll-behavior:none}
 button,input,textarea{font:inherit}
-#viewport{position:fixed;inset:0;overflow:hidden;background-color:#fff;background-image:linear-gradient(rgba(0,0,0,.055) 1px, transparent 1px),linear-gradient(90deg, rgba(0,0,0,.055) 1px, transparent 1px);background-size:var(--grid-size) var(--grid-size);cursor:default}
+#viewport{position:fixed;inset:0;overflow:hidden;touch-action:none;overscroll-behavior:none;background-color:#fff;background-image:linear-gradient(rgba(0,0,0,.055) 1px, transparent 1px),linear-gradient(90deg, rgba(0,0,0,.055) 1px, transparent 1px);background-size:var(--grid-size) var(--grid-size);cursor:default}
 #world{position:absolute;left:0;top:0;transform-origin:0 0}
 .item{position:absolute;user-select:none;touch-action:none}
 .item.editable{cursor:move}
@@ -696,6 +696,49 @@ textarea{min-height:90px;resize:vertical}
 .draft-handle.bl{left:-7px;bottom:-7px;cursor:nesw-resize}.draft-handle.bm{left:50%;bottom:-7px;transform:translateX(-50%);cursor:ns-resize}.draft-handle.br{right:-7px;bottom:-7px;cursor:nwse-resize}
 .color-dot{width:24px;height:24px;border-radius:50%;border:2px solid rgba(0,0,0,.14);box-shadow:0 4px 14px rgba(0,0,0,.08);cursor:pointer}
 .color-dot.active{outline:3px solid #111;outline-offset:2px}
+@media(max-width:760px){
+    #tools{
+        left:50%;
+        top:auto;
+        bottom:12px;
+        transform:translateX(-50%) scale(var(--ui-scale));
+        transform-origin:center bottom;
+        flex-direction:row;
+        gap:7px;
+        padding:6px;
+        background:rgba(255,255,255,.62);
+        backdrop-filter:blur(18px);
+    }
+    .tool{
+        width:42px;
+        height:42px;
+        font-size:15px;
+    }
+    .panel{
+        left:50%;
+        top:auto;
+        bottom:72px;
+        transform:translateX(-50%) scale(var(--ui-scale));
+        transform-origin:center bottom;
+        max-width:calc(100vw - 22px);
+        overflow-x:auto;
+    }
+    .color-dot{
+        min-width:26px;
+        min-height:26px;
+    }
+    .toolbar button{
+        font-size:10px;
+        padding:7px 8px;
+    }
+    .draft-wrap{
+        width:300px!important;
+        height:120px!important;
+    }
+    .draft-input{
+        font-size:44px;
+    }
+}
 .btn{border:0;background:#111;color:white;padding:10px 12px;font-weight:800;margin-top:8px}
 .btn2{border:0;background:#eee;color:#111;padding:10px 12px;font-weight:800;margin-top:8px}
 #loginOverlay{position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:flex;align-items:center;justify-content:center}
@@ -735,7 +778,7 @@ textarea{min-height:90px;resize:vertical}
 <form id="imageForm" action="{{ url_for('add_image') }}" method="POST" enctype="multipart/form-data" class="hidden">
     <input name="x" id="imageX" type="hidden">
     <input name="y" id="imageY" type="hidden">
-    <input id="imagePicker" name="image" type="file" accept=".png,.jpg,.jpeg,.gif,.webp">
+    <input id="imagePicker" name="image" type="file" accept="image/png,image/jpeg,image/gif,image/webp,.png,.jpg,.jpeg,.gif,.webp">
 </form>
 
 <form id="audioForm" action="{{ url_for('add_audio') }}" method="POST" enctype="multipart/form-data" class="hidden">
@@ -956,6 +999,16 @@ function createTextBox(){
         h.className = "draft-handle " + pos;
         h.dataset.handle = pos;
         h.addEventListener("mousedown", startDraftResize);
+        h.addEventListener("touchstart", e=>{
+            if(!e.touches || !e.touches.length) return;
+            startDraftResize({
+                preventDefault:()=>e.preventDefault(),
+                stopPropagation:()=>e.stopPropagation(),
+                target:e.target,
+                clientX:e.touches[0].clientX,
+                clientY:e.touches[0].clientY
+            });
+        }, {passive:false});
         box.appendChild(h);
     });
 
@@ -1050,11 +1103,11 @@ function startDraftResize(e){
     };
 }
 
-document.addEventListener("mousemove", e=>{
+function updateDraftResize(clientX, clientY){
     if(!draftResize || !draftBox) return;
 
-    let dx = e.clientX - draftResize.x;
-    let dy = e.clientY - draftResize.y;
+    let dx = (clientX - draftResize.x) / zoom;
+    let dy = (clientY - draftResize.y) / zoom;
 
     let left = draftResize.left;
     let top = draftResize.top;
@@ -1082,11 +1135,26 @@ document.addEventListener("mousemove", e=>{
     draftBox.style.top = top + "px";
     draftBox.style.width = w + "px";
     draftBox.style.height = h + "px";
+}
+
+document.addEventListener("mousemove", e=>{
+    updateDraftResize(e.clientX, e.clientY);
 });
+
+document.addEventListener("touchmove", e=>{
+    if(!draftResize || !e.touches || !e.touches.length) return;
+    e.preventDefault();
+    updateDraftResize(e.touches[0].clientX, e.touches[0].clientY);
+}, {passive:false});
 
 document.addEventListener("mouseup", ()=>{
     draftResize = null;
 });
+
+document.addEventListener("touchend", ()=>{
+    draftResize = null;
+});
+
 
 document.addEventListener("mousedown", e=>{
     if(draftBox && !draftBox.contains(e.target) && !e.target.closest("#tools")){
@@ -1130,6 +1198,25 @@ function resetCamera(){
     lastLoadKey = "";
     applyCamera();
     loadViewport();
+}
+
+function distanceBetweenTouches(t1, t2){
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function midpointTouches(t1, t2){
+    return {
+        x: (t1.clientX + t2.clientX) / 2,
+        y: (t1.clientY + t2.clientY) / 2
+    };
+}
+
+function isTouchUiTarget(target){
+    return !!(target && target.closest(
+        "#tools,.panel,#settingsOverlay,#loginOverlay,.toolbar,button,input,textarea,select,audio,.draft-wrap,.draft-input"
+    ));
 }
 
 applyCamera();
@@ -1213,7 +1300,7 @@ window.addEventListener("keydown", e=>{
 viewport.addEventListener("mousedown", e=>{
     const isPanButton = e.button === 2 || e.button === 1 || (e.button === 0 && e.shiftKey);
     if(!isPanButton) return;
-    if(e.target.closest("#tools,.panel,#settingsOverlay,#loginOverlay,.toolbar,button,input,textarea,select,audio")) return;
+    if(e.target.closest("#tools,.panel,#settingsOverlay,#loginOverlay,.toolbar,button,input,textarea,select,audio,.item,.draft-wrap")) return;
 
     panning=true;
     panStart={x:e.clientX,y:e.clientY};
@@ -1221,12 +1308,14 @@ viewport.addEventListener("mousedown", e=>{
     viewport.style.cursor="grabbing";
     e.preventDefault();
 });
+
 document.addEventListener("mousemove", e=>{
     if(!panning) return;
     camera.x = camStart.x + (e.clientX-panStart.x);
     camera.y = camStart.y + (e.clientY-panStart.y);
     applyCamera();
 });
+
 document.addEventListener("mouseup", ()=>{
     if(panning){
         panning=false;
@@ -1234,6 +1323,82 @@ document.addEventListener("mouseup", ()=>{
         loadViewport();
     }
 });
+
+let touchPan=false;
+let touchPanStart={x:0,y:0};
+let touchCamStart={x:0,y:0};
+let pinch=false;
+let pinchStartDistance=0;
+let pinchStartZoom=1;
+let pinchStartWorld={x:0,y:0};
+let pinchStartMid={x:0,y:0};
+
+viewport.addEventListener("touchstart", e=>{
+    if(!e.touches || !e.touches.length) return;
+    if(isTouchUiTarget(e.target)) return;
+
+    if(e.touches.length === 2){
+        pinch = true;
+        touchPan = false;
+        const t1 = e.touches[0];
+        const t2 = e.touches[1];
+        pinchStartDistance = distanceBetweenTouches(t1, t2);
+        pinchStartZoom = zoom;
+        pinchStartMid = midpointTouches(t1, t2);
+        pinchStartWorld = screenToWorld(pinchStartMid.x, pinchStartMid.y);
+        e.preventDefault();
+        return;
+    }
+
+    if(e.touches.length === 1){
+        if(drawMode || e.target.closest(".item")) return;
+
+        const t = e.touches[0];
+        touchPan = true;
+        touchPanStart = {x:t.clientX, y:t.clientY};
+        touchCamStart = {x:camera.x, y:camera.y};
+        e.preventDefault();
+    }
+}, {passive:false});
+
+document.addEventListener("touchmove", e=>{
+    if(pinch && e.touches && e.touches.length >= 2){
+        const t1 = e.touches[0];
+        const t2 = e.touches[1];
+        const dist = distanceBetweenTouches(t1, t2);
+        const mid = midpointTouches(t1, t2);
+
+        if(pinchStartDistance > 0){
+            zoom = clampZoom(pinchStartZoom * (dist / pinchStartDistance));
+            camera.x = mid.x - pinchStartWorld.x * zoom;
+            camera.y = mid.y - pinchStartWorld.y * zoom;
+            applyCamera();
+        }
+
+        e.preventDefault();
+        return;
+    }
+
+    if(touchPan && e.touches && e.touches.length === 1){
+        const t = e.touches[0];
+        camera.x = touchCamStart.x + (t.clientX - touchPanStart.x);
+        camera.y = touchCamStart.y + (t.clientY - touchPanStart.y);
+        applyCamera();
+        e.preventDefault();
+    }
+}, {passive:false});
+
+document.addEventListener("touchend", e=>{
+    if(pinch && (!e.touches || e.touches.length < 2)){
+        pinch = false;
+        loadViewport();
+    }
+    if(touchPan && (!e.touches || e.touches.length === 0)){
+        touchPan = false;
+        loadViewport();
+    }
+}, {passive:false});
+
 
 function itemHtml(item){
     const editable = item.can_edit ? " editable" : "";
@@ -1379,27 +1544,73 @@ function bindDragging(){
     document.querySelectorAll(".item.editable").forEach(el=>{
         if(el.dataset.bound==="1")return;
         el.dataset.bound="1";
+
         let drag=false, sx=0, sy=0, ox=0, oy=0;
-        el.addEventListener("mousedown",e=>{
-            if(e.button===2 || e.target.closest("button") || document.body.classList.contains("draw-mode"))return;
-            drag=true; sx=e.clientX; sy=e.clientY;
-            ox=parseInt(el.style.left||"0"); oy=parseInt(el.style.top||"0");
-            e.preventDefault();
-        });
-        document.addEventListener("mousemove",e=>{
+
+        function startItemDrag(clientX, clientY){
+            const item=getItem(el.dataset.id);
+            if(!item)return;
+
+            drag=true;
+            sx=clientX;
+            sy=clientY;
+            ox=parseInt(el.style.left||"0");
+            oy=parseInt(el.style.top||"0");
+        }
+
+        function moveItemDrag(clientX, clientY){
             if(!drag)return;
-            const item=getItem(el.dataset.id); if(!item)return;
-            item.x=ox+((e.clientX-sx)/zoom);
-            item.y=oy+((e.clientY-sy)/zoom);
-            el.style.left=item.x+"px"; el.style.top=item.y+"px";
-        });
-        document.addEventListener("mouseup",()=>{
+
+            const item=getItem(el.dataset.id);
+            if(!item)return;
+
+            item.x=ox+((clientX-sx)/zoom);
+            item.y=oy+((clientY-sy)/zoom);
+            el.style.left=item.x+"px";
+            el.style.top=item.y+"px";
+        }
+
+        function endItemDrag(){
             if(!drag)return;
             drag=false;
-            const item=getItem(el.dataset.id); if(item) savePos(item);
+            const item=getItem(el.dataset.id);
+            if(item) savePos(item);
+        }
+
+        el.addEventListener("mousedown",e=>{
+            if(e.button===2 || e.target.closest("button") || document.body.classList.contains("draw-mode"))return;
+            startItemDrag(e.clientX, e.clientY);
+            e.preventDefault();
+            e.stopPropagation();
         });
+
+        el.addEventListener("touchstart",e=>{
+            if(document.body.classList.contains("draw-mode"))return;
+            if(e.target.closest("button,audio,input,textarea"))return;
+            if(!e.touches || e.touches.length !== 1)return;
+
+            const t=e.touches[0];
+            startItemDrag(t.clientX, t.clientY);
+            e.preventDefault();
+            e.stopPropagation();
+        }, {passive:false});
+
+        document.addEventListener("mousemove",e=>{
+            moveItemDrag(e.clientX, e.clientY);
+        });
+
+        document.addEventListener("touchmove",e=>{
+            if(!drag || !e.touches || !e.touches.length)return;
+            const t=e.touches[0];
+            moveItemDrag(t.clientX, t.clientY);
+            e.preventDefault();
+        }, {passive:false});
+
+        document.addEventListener("mouseup",endItemDrag);
+        document.addEventListener("touchend",endItemDrag);
     });
 }
+
 
 // drawing
 let drawMode=false, drawing=false, points=[];
@@ -1418,7 +1629,7 @@ window.addEventListener("resize", resizeDrawCanvas);
 
 function isUiTarget(e){
     return !!(e.target && e.target.closest(
-        "#tools,.panel,#settingsOverlay,#loginOverlay,.toolbar,button,input,textarea,select"
+        "#tools,.panel,#settingsOverlay,#loginOverlay,.toolbar,button,input,textarea,select,audio,.draft-wrap"
     ));
 }
 
@@ -1441,67 +1652,97 @@ function selectDrawColor(color, el){
     document.body.classList.add("draw-mode");
 }
 
-function drawPoint(e){
-    const p=screenToWorld(e.clientX,e.clientY);
-    return {x:e.clientX, y:e.clientY, realX:p.x, realY:p.y};
+function drawPointFromClient(clientX, clientY){
+    const p=screenToWorld(clientX, clientY);
+    return {x:clientX, y:clientY, realX:p.x, realY:p.y};
+}
+
+function startDrawing(clientX, clientY){
+    if(!canvas || !ctx || !drawMode) return;
+
+    drawing=true;
+    points=[];
+
+    const p=drawPointFromClient(clientX, clientY);
+    points.push({x:p.realX,y:p.realY});
+
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.strokeStyle=selectedDrawColor || "#111";
+    ctx.lineWidth=selectedDrawSize;
+    ctx.lineCap="round";
+    ctx.lineJoin="round";
+    ctx.beginPath();
+    ctx.moveTo(p.x,p.y);
+}
+
+function moveDrawing(clientX, clientY){
+    if(!drawMode || !drawing || !ctx) return;
+
+    const p=drawPointFromClient(clientX, clientY);
+    const last=points[points.length-1];
+
+    if(last && Math.abs(last.x-p.realX)+Math.abs(last.y-p.realY)<4) return;
+
+    points.push({x:p.realX,y:p.realY});
+    ctx.lineTo(p.x,p.y);
+    ctx.stroke();
+}
+
+function finishDrawing(){
+    if(!drawMode || !drawing) return;
+
+    drawing=false;
+    if(ctx) ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    if(points.length<2) return;
+
+    postJson("/api/add-drawing",{
+        points,
+        stroke:selectedDrawColor,
+        stroke_width:selectedDrawSize
+    }).then(out=>{
+        lastLoadKey="";
+        loadViewport();
+    });
 }
 
 if(canvas && ctx){
     viewport.addEventListener("mousedown", e=>{
         if(!drawMode) return;
         if(e.button !== 0) return;
-        if(isUiTarget(e)) return;
+        if(isUiTarget(e) || e.target.closest(".item")) return;
 
-        drawing=true;
-        points=[];
-
-        const p=drawPoint(e);
-        points.push({x:p.realX,y:p.realY});
-
-        ctx.clearRect(0,0,canvas.width,canvas.height);
-        ctx.strokeStyle=selectedDrawColor || "#111";
-        ctx.lineWidth=selectedDrawSize;
-        ctx.lineCap="round";
-        ctx.lineJoin="round";
-        ctx.beginPath();
-        ctx.moveTo(p.x,p.y);
-
+        startDrawing(e.clientX, e.clientY);
         e.preventDefault();
     });
 
-    document.addEventListener("mousemove", e=>{
-        if(!drawMode || !drawing) return;
-        if(isUiTarget(e)) return;
+    viewport.addEventListener("touchstart", e=>{
+        if(!drawMode) return;
+        if(isTouchUiTarget(e.target) || e.target.closest(".item")) return;
+        if(!e.touches || e.touches.length !== 1) return;
 
-        const p=drawPoint(e);
-        const last=points[points.length-1];
-
-        if(last && Math.abs(last.x-p.realX)+Math.abs(last.y-p.realY)<4) return;
-
-        points.push({x:p.realX,y:p.realY});
-        ctx.lineTo(p.x,p.y);
-        ctx.stroke();
-
+        const t=e.touches[0];
+        startDrawing(t.clientX, t.clientY);
         e.preventDefault();
     }, {passive:false});
 
-    document.addEventListener("mouseup",()=>{
+    document.addEventListener("mousemove", e=>{
         if(!drawMode || !drawing) return;
+        moveDrawing(e.clientX, e.clientY);
+        e.preventDefault();
+    }, {passive:false});
 
-        drawing=false;
-        ctx.clearRect(0,0,canvas.width,canvas.height);
+    document.addEventListener("touchmove", e=>{
+        if(!drawMode || !drawing) return;
+        if(!e.touches || !e.touches.length) return;
 
-        if(points.length<2) return;
+        const t=e.touches[0];
+        moveDrawing(t.clientX, t.clientY);
+        e.preventDefault();
+    }, {passive:false});
 
-        postJson("/api/add-drawing",{
-            points,
-            stroke:selectedDrawColor,
-            stroke_width:selectedDrawSize
-        }).then(out=>{
-            lastLoadKey="";
-            loadViewport();
-        });
-    });
+    document.addEventListener("mouseup",finishDrawing);
+    document.addEventListener("touchend",finishDrawing);
 }
 
 </script>
