@@ -1,51 +1,34 @@
 # app.py
-# Render start command:
-#   gunicorn app:app
-#
-# Required Render environment variables:
-#   SECRET_KEY=random_long_secret
-#   DISCORD_BOT_TOKEN=your_bot_token
-#   DISCORD_DB_CHANNEL_ID=your_private_channel_id
+# Render Start Command:
+# gunicorn app:app
 #
 # requirements.txt:
-#   Flask
-#   Werkzeug
-#   requests
-#   gunicorn
+# Flask
+# Werkzeug
+# requests
+# gunicorn
 
-import gzip
-import hashlib
-import html
-import json
 import os
 import re
-import secrets
-import threading
+import json
+import gzip
 import time
-from functools import wraps
+import html
+import secrets
+import hashlib
+import threading
 from io import BytesIO
 from pathlib import Path
+from functools import wraps
 
 import requests
 from flask import (
-    Flask,
-    Response,
-    abort,
-    flash,
-    jsonify,
-    redirect,
-    render_template_string,
-    request,
-    session,
-    url_for,
+    Flask, request, redirect, url_for, session, flash,
+    render_template_string, jsonify, abort, Response
 )
-from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
-
-# -----------------------------
-# Config
-# -----------------------------
 
 APP_NAME = os.environ.get("APP_NAME", "Boardlume")
 DISCORD_API = "https://discord.com/api/v10"
@@ -54,24 +37,25 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 DISCORD_DB_CHANNEL_ID = os.environ.get("DISCORD_DB_CHANNEL_ID", "").strip()
 
 CREATOR_EMAIL = os.environ.get("CREATOR_EMAIL", "tuna.iren@outlook.com").strip().lower()
-MOD_EMAILS = [
-    x.strip().lower()
-    for x in os.environ.get("MOD_EMAILS", "").split(",")
-    if x.strip()
-]
+MOD_EMAILS = [x.strip().lower() for x in os.environ.get("MOD_EMAILS", "").split(",") if x.strip()]
 
 MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", str(10 * 1024 * 1024)))
 MAX_DB_SIZE = int(os.environ.get("MAX_DB_SIZE", str(7 * 1024 * 1024)))
 
-MAX_TOTAL_ITEMS = int(os.environ.get("MAX_TOTAL_ITEMS", "500"))
-MAX_ITEMS_PER_USER = int(os.environ.get("MAX_ITEMS_PER_USER", "120"))
-MAX_DRAW_POINTS = int(os.environ.get("MAX_DRAW_POINTS", "500"))
-MAX_TEXT_CHARS = int(os.environ.get("MAX_TEXT_CHARS", "400"))
+MAX_TOTAL_ITEMS = int(os.environ.get("MAX_TOTAL_ITEMS", "400"))
+MAX_ITEMS_PER_USER = int(os.environ.get("MAX_ITEMS_PER_USER", "100"))
+MAX_DRAW_POINTS = int(os.environ.get("MAX_DRAW_POINTS", "300"))
+MAX_TEXT_CHARS = int(os.environ.get("MAX_TEXT_CHARS", "300"))
+MAX_TEXT_W = int(os.environ.get("MAX_TEXT_W", "700"))
+MAX_TEXT_H = int(os.environ.get("MAX_TEXT_H", "300"))
 
-CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "10"))
-NAME_CHANGE_COOLDOWN_SECONDS = int(
-    os.environ.get("NAME_CHANGE_COOLDOWN_SECONDS", str(10 * 24 * 60 * 60))
-)
+CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "45"))
+FAST_BOOT_MESSAGE_PAGES = int(os.environ.get("FAST_BOOT_MESSAGE_PAGES", "4"))
+DB_SNAPSHOT_KEEP = max(1, int(os.environ.get("DB_SNAPSHOT_KEEP", "1")))
+DB_SNAPSHOT_DELETE_LIMIT = max(1, int(os.environ.get("DB_SNAPSHOT_DELETE_LIMIT", "25")))
+AUTO_DELETE_OLD_SNAPSHOTS = os.environ.get("AUTO_DELETE_OLD_SNAPSHOTS", "0").strip().lower() not in {"0", "false", "no", "off"}
+
+NAME_CHANGE_COOLDOWN_SECONDS = int(os.environ.get("NAME_CHANGE_COOLDOWN_SECONDS", str(10 * 24 * 60 * 60)))
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a"}
@@ -80,15 +64,14 @@ EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(64))
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_HTTPONLY"] = True
 
-CACHE = {"time": 0.0, "store": None}
+CACHE = {"time": 0, "store": None}
 ATTACHMENT_CACHE = {"items": {}, "seconds": 20 * 60}
+CLEANUP_LOCK = threading.Lock()
 
 
 # -----------------------------
-# Basic helpers
+# Helpers
 # -----------------------------
 
 def esc(value):
@@ -131,7 +114,7 @@ def clamp_int(value, low, high, default):
     return max(low, min(high, value))
 
 
-def safe_hex_color(value, default="#111111"):
+def safe_hex_color(value, default):
     value = (value or "").strip()
     if re.fullmatch(r"#[0-9A-Fa-f]{6}", value):
         return value
@@ -143,16 +126,71 @@ def seconds_text(seconds):
     days = seconds // 86400
     hours = (seconds % 86400) // 3600
     minutes = (seconds % 3600) // 60
-    if days:
+    if days > 0:
         return f"{days} days {hours} hours"
-    if hours:
+    if hours > 0:
         return f"{hours} hours {minutes} minutes"
     return f"{minutes} minutes"
+
+
+def file_size_text(size):
+    try:
+        size = int(size)
+    except Exception:
+        size = 0
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size} B"
 
 
 def is_staff_email(email):
     email = normalize_email(email)
     return email == CREATOR_EMAIL or email in MOD_EMAILS
+
+
+def current_email():
+    return session.get("email", "")
+
+
+def current_user_id():
+    if session.get("user_id"):
+        return session.get("user_id")
+    email = current_email()
+    if not email:
+        return ""
+    return user_id_from_email(email)
+
+
+def current_user():
+    uid = current_user_id()
+    if not uid:
+        return None
+    try:
+        db = load_store()["db"]
+        user = db["users"].get(uid)
+        if user:
+            return user
+    except Exception:
+        return None
+    return None
+
+
+def current_is_staff():
+    user = current_user()
+    return bool(user and is_staff_email(user.get("email", "")))
+
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not current_user():
+            if request.path.startswith("/api/"):
+                return jsonify({"ok": False, "error": "Login first."}), 401
+            return redirect(url_for("home"))
+        return fn(*args, **kwargs)
+    return wrapper
 
 
 def allowed_image(filename):
@@ -165,7 +203,8 @@ def allowed_audio(filename):
 
 def guess_content_type(filename, fallback="application/octet-stream"):
     ext = Path((filename or "").lower()).suffix
-    return {
+
+    mapping = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
@@ -175,16 +214,14 @@ def guess_content_type(filename, fallback="application/octet-stream"):
         ".wav": "audio/wav",
         ".ogg": "audio/ogg",
         ".m4a": "audio/mp4",
-    }.get(ext, fallback)
+    }
 
+    return mapping.get(ext, fallback)
 
-# -----------------------------
-# DB helpers
-# -----------------------------
 
 def blank_db():
     return {
-        "version": 6,
+        "version": 4,
         "users": {},
         "items": {},
         "created_at": now_ms(),
@@ -204,33 +241,10 @@ def normalize_db(db):
     if not isinstance(clean.get("items"), dict):
         clean["items"] = {}
 
-    clean["version"] = 6
+    clean["version"] = 4
     clean.setdefault("created_at", now_ms())
     clean.setdefault("updated_at", now_ms())
     return clean
-
-
-def clear_cache():
-    CACHE["time"] = 0.0
-    CACHE["store"] = None
-
-
-def item_bounds(item):
-    x = int(item.get("x", 0))
-    y = int(item.get("y", 0))
-    w = int(item.get("w", 100))
-    h = int(item.get("h", 100))
-    return x, y, w, h
-
-
-def intersects(item, left, top, right, bottom, margin=1200):
-    x, y, w, h = item_bounds(item)
-    return not (
-        x + w < left - margin
-        or x > right + margin
-        or y + h < top - margin
-        or y > bottom + margin
-    )
 
 
 def item_limit_ok(db, user):
@@ -238,13 +252,7 @@ def item_limit_ok(db, user):
     if total >= MAX_TOTAL_ITEMS:
         return False, "board full"
 
-    mine = len(
-        [
-            x
-            for x in db.get("items", {}).values()
-            if x.get("user_id") == user.get("id")
-        ]
-    )
+    mine = len([x for x in db.get("items", {}).values() if x.get("user_id") == user.get("id")])
     if mine >= MAX_ITEMS_PER_USER:
         return False, "item limit reached"
 
@@ -267,15 +275,33 @@ def rate_limit_user(db, user, key, seconds):
     return True, ""
 
 
+def item_bounds(item):
+    x = int(item.get("x", 0))
+    y = int(item.get("y", 0))
+    w = int(item.get("w", 100))
+    h = int(item.get("h", 100))
+    return x, y, w, h
+
+
+def intersects(item, left, top, right, bottom, margin=900):
+    x, y, w, h = item_bounds(item)
+    return not (
+        x + w < left - margin or
+        x > right + margin or
+        y + h < top - margin or
+        y > bottom + margin
+    )
+
+
 # -----------------------------
-# Discord storage
+# Discord snapshot storage
 # -----------------------------
 
 def require_storage_config():
     if not DISCORD_BOT_TOKEN:
-        raise RuntimeError("Missing DISCORD_BOT_TOKEN on Render.")
+        raise RuntimeError("Missing DISCORD_BOT_TOKEN.")
     if not DISCORD_DB_CHANNEL_ID:
-        raise RuntimeError("Missing DISCORD_DB_CHANNEL_ID on Render.")
+        raise RuntimeError("Missing DISCORD_DB_CHANNEL_ID.")
 
 
 def discord_request(method, endpoint, **kwargs):
@@ -290,26 +316,26 @@ def discord_request(method, endpoint, **kwargs):
 
         if r.status_code == 429:
             try:
-                retry_after = float(r.json().get("retry_after", 1.0))
+                retry_after = float(r.json().get("retry_after", 1))
             except Exception:
-                retry_after = 1.0
-            time.sleep(min(5.0, retry_after))
+                retry_after = 1
+            time.sleep(retry_after)
             continue
 
         if not (200 <= r.status_code < 300):
-            detail = ""
-            try:
-                detail = r.text[:200]
-            except Exception:
-                pass
-            raise RuntimeError(f"Discord storage error {r.status_code}: {detail}")
+            raise RuntimeError(f"storage error {r.status_code}")
 
         return r
 
-    raise RuntimeError("Discord storage rate limited.")
+    raise RuntimeError("storage rate limit")
 
 
-def fetch_messages(max_pages=3, stop_after_snapshot=True):
+def clear_cache():
+    CACHE["time"] = 0
+    CACHE["store"] = None
+
+
+def fetch_messages(max_pages=FAST_BOOT_MESSAGE_PAGES, stop_after_snapshot=True):
     messages_all = []
     before = None
 
@@ -318,22 +344,16 @@ def fetch_messages(max_pages=3, stop_after_snapshot=True):
         if before:
             params["before"] = before
 
-        r = discord_request(
-            "GET",
-            f"/channels/{DISCORD_DB_CHANNEL_ID}/messages",
-            params=params,
-        )
+        r = discord_request("GET", f"/channels/{DISCORD_DB_CHANNEL_ID}/messages", params=params)
         messages = r.json()
+
         if not messages:
             break
 
         messages_all.extend(messages)
         before = messages[-1]["id"]
 
-        if stop_after_snapshot and any(
-            (m.get("content", "") or "").startswith("WBDBSNAP|")
-            for m in messages
-        ):
+        if stop_after_snapshot and any((m.get("content", "") or "").startswith("WBDBSNAP|") for m in messages):
             break
 
         if len(messages) < 100:
@@ -345,19 +365,8 @@ def fetch_messages(max_pages=3, stop_after_snapshot=True):
 def post_attachment(content, filename, file_bytes, content_type):
     payload = {"content": content}
     data = {"payload_json": json.dumps(payload)}
-    files = {
-        "files[0]": (
-            filename,
-            BytesIO(file_bytes),
-            content_type or "application/octet-stream",
-        )
-    }
-    r = discord_request(
-        "POST",
-        f"/channels/{DISCORD_DB_CHANNEL_ID}/messages",
-        data=data,
-        files=files,
-    )
+    files = {"files[0]": (filename, BytesIO(file_bytes), content_type or "application/octet-stream")}
+    r = discord_request("POST", f"/channels/{DISCORD_DB_CHANNEL_ID}/messages", data=data, files=files)
     clear_cache()
     return r.json()
 
@@ -366,24 +375,95 @@ def delete_message(message_id):
     if not message_id:
         return False
     try:
-        discord_request(
-            "DELETE",
-            f"/channels/{DISCORD_DB_CHANNEL_ID}/messages/{message_id}",
-        )
+        discord_request("DELETE", f"/channels/{DISCORD_DB_CHANNEL_ID}/messages/{message_id}")
         return True
     except Exception:
         return False
 
 
+def cleanup_old_snapshots(keep=None, delete_limit=None, max_pages=6):
+    # Deletes only old WBDBSNAP database messages.
+    # It does NOT delete uploaded images/audio attachments.
+    # This version is intentionally bounded so the website does not freeze.
+    if keep is None:
+        keep = DB_SNAPSHOT_KEEP
+    if delete_limit is None:
+        delete_limit = DB_SNAPSHOT_DELETE_LIMIT
+
+    keep = max(1, int(keep))
+    delete_limit = max(1, int(delete_limit))
+    max_pages = max(1, int(max_pages))
+
+    try:
+        messages = fetch_messages(max_pages=max_pages, stop_after_snapshot=False)
+    except Exception:
+        return {"ok": False, "deleted": 0, "kept": 0, "total": 0}
+
+    snapshots = [
+        m for m in messages
+        if (m.get("content", "") or "").startswith("WBDBSNAP|")
+    ]
+
+    snapshots.sort(key=lambda m: int(m.get("id", "0")), reverse=True)
+
+    to_keep = snapshots[:keep]
+    to_delete = snapshots[keep:keep + delete_limit]
+
+    deleted = 0
+
+    for msg in to_delete:
+        if delete_message(msg.get("id", "")):
+            deleted += 1
+            time.sleep(0.18)
+
+    if deleted:
+        clear_cache()
+
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "kept": len(to_keep),
+        "total": len(snapshots),
+    }
+
+
+def cleanup_old_snapshots_background():
+    # Manual/light cleanup only. Do not call this after every save.
+    def worker():
+        if not CLEANUP_LOCK.acquire(blocking=False):
+            return
+
+        try:
+            cleanup_old_snapshots(
+                keep=DB_SNAPSHOT_KEEP,
+                delete_limit=DB_SNAPSHOT_DELETE_LIMIT,
+                max_pages=6,
+            )
+        finally:
+            CLEANUP_LOCK.release()
+
+    try:
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+    except Exception:
+        pass
+
+
 def delete_message_background(message_id):
+    # Delete exactly one old DB snapshot in the background.
+    # This prevents freezing caused by scanning/deleting many Discord messages.
     if not message_id:
         return
 
     def worker():
-        delete_message(message_id)
+        try:
+            delete_message(message_id)
+        except Exception:
+            pass
 
     try:
-        threading.Thread(target=worker, daemon=True).start()
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
     except Exception:
         pass
 
@@ -393,13 +473,12 @@ def load_store(force=False):
     if not force and CACHE["store"] is not None and now - CACHE["time"] < CACHE_SECONDS:
         return CACHE["store"]
 
-    messages = fetch_messages(max_pages=3, stop_after_snapshot=True)
+    messages = fetch_messages(max_pages=FAST_BOOT_MESSAGE_PAGES, stop_after_snapshot=True)
 
     db = blank_db()
     snapshot_loaded = False
     latest_snapshot_id = ""
 
-    # Discord returns newest first.
     for msg in messages:
         content = msg.get("content", "") or ""
         attachments = msg.get("attachments", []) or []
@@ -423,49 +502,41 @@ def load_store(force=False):
     store = {
         "db": normalize_db(db),
         "snapshot_loaded": snapshot_loaded,
-        "latest_snapshot_id": latest_snapshot_id,
         "message_count": len(messages),
+        "latest_snapshot_id": latest_snapshot_id,
     }
     CACHE["time"] = now
     CACHE["store"] = store
     return store
 
 
-def save_db(db, previous_snapshot_id=""):
+def save_db(db):
     db = normalize_db(db)
     db["updated_at"] = now_ms()
 
     raw_json = json.dumps(db, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    raw_gz = gzip.compress(raw_json, compresslevel=6)
+    raw = gzip.compress(raw_json, compresslevel=6)
 
-    if len(raw_gz) > MAX_DB_SIZE:
+    if len(raw) > MAX_DB_SIZE:
         raise ValueError("board data too large")
 
-    msg = post_attachment(
-        content=f"WBDBSNAP|v6|gz|{int(time.time())}",
+    post_attachment(
+        content=f"WBDBSNAP|v4|gz|{int(time.time())}",
         filename="whiteboard-db.json.gz",
-        file_bytes=raw_gz,
+        file_bytes=raw,
         content_type="application/gzip",
     )
 
+    # Old stable behavior: just save and refresh cache.
+    # No auto scanning/deleting old DB messages during user actions.
+    # This prevents Render from freezing.
     clear_cache()
-
-    new_snapshot_id = msg.get("id", "")
-    if previous_snapshot_id and previous_snapshot_id != new_snapshot_id:
-        # Important: delete only the previous snapshot, never scan/delete many messages.
-        # This prevents the Render app from freezing after user actions.
-        delete_message_background(previous_snapshot_id)
-
-    return new_snapshot_id
 
 
 def cache_attachment(kind, key, info):
     if not key or not info:
         return
-    ATTACHMENT_CACHE["items"][(kind, str(key))] = {
-        "time": time.time(),
-        "info": info,
-    }
+    ATTACHMENT_CACHE["items"][(kind, str(key))] = {"time": time.time(), "info": info}
 
 
 def get_cached_attachment(kind, key):
@@ -484,10 +555,7 @@ def attachment_info_from_message(message_id):
         return cached
 
     try:
-        r = discord_request(
-            "GET",
-            f"/channels/{DISCORD_DB_CHANNEL_ID}/messages/{message_id}",
-        )
+        r = discord_request("GET", f"/channels/{DISCORD_DB_CHANNEL_ID}/messages/{message_id}")
         msg = r.json()
         attachments = msg.get("attachments", []) or []
         if not attachments:
@@ -508,49 +576,8 @@ def attachment_info_from_message(message_id):
 
 
 # -----------------------------
-# User/session helpers
+# Item serialization
 # -----------------------------
-
-def current_email():
-    return session.get("email", "")
-
-
-def current_user_id():
-    if session.get("user_id"):
-        return session.get("user_id")
-    email = current_email()
-    if not email:
-        return ""
-    return user_id_from_email(email)
-
-
-def current_user():
-    uid = current_user_id()
-    if not uid:
-        return None
-    try:
-        db = load_store()["db"]
-        return db["users"].get(uid)
-    except Exception:
-        return None
-
-
-def current_is_staff():
-    user = current_user()
-    return bool(user and is_staff_email(user.get("email", "")))
-
-
-def login_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not current_user():
-            if request.path.startswith("/api/"):
-                return jsonify({"ok": False, "error": "Login first."}), 401
-            return redirect(url_for("home"))
-        return fn(*args, **kwargs)
-
-    return wrapper
-
 
 def item_can_edit(item, user=None):
     if not user:
@@ -574,7 +601,8 @@ def public_item(item, user=None):
         "z": int(item.get("z", 1)),
         "text": item.get("text", ""),
         "color": item.get("color", "#111111"),
-        "font": clamp_int(item.get("font"), 10, 96, 38),
+        "bg": item.get("bg", "#ffffff"),
+        "font": clamp_int(item.get("font"), 10, 72, 18),
         "stroke": item.get("stroke", "#111111"),
         "stroke_width": int(item.get("stroke_width", 4)),
         "points": item.get("points", []),
@@ -595,7 +623,7 @@ def public_item(item, user=None):
 def visible_items(db, user, left, top, right, bottom):
     items = []
     for raw in db.get("items", {}).values():
-        if intersects(raw, left, top, right, bottom):
+        if intersects(raw, left, top, right, bottom, margin=1200):
             items.append(public_item(raw, user))
     items.sort(key=lambda x: (x["z"], x["created"]))
     return items
@@ -605,91 +633,61 @@ def visible_items(db, user, left, top, right, bottom):
 # UI
 # -----------------------------
 
-HTML = r"""
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <title>{{ app_name }}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{box-sizing:border-box}
-:root{--grid:42px}
-html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}
+:root{--ui-scale:1;--grid-size:42px}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif;touch-action:none}
 button,input,textarea{font:inherit}
-button{cursor:pointer}
-.hidden{display:none!important}
-
-#board{position:fixed;inset:0;z-index:1;overflow:hidden;background:#fff;background-image:linear-gradient(rgba(0,0,0,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(0,0,0,.055) 1px,transparent 1px);background-size:var(--grid) var(--grid)}
-#world{position:absolute;left:0;top:0;transform-origin:0 0;z-index:2}
-#drawCanvas{position:fixed;inset:0;width:100vw;height:100vh;display:none;z-index:30;cursor:crosshair}
-body.draw-on #drawCanvas{display:block}
-
+#viewport{position:fixed;inset:0;overflow:hidden;background-color:#fff;background-image:linear-gradient(rgba(0,0,0,.055) 1px, transparent 1px),linear-gradient(90deg, rgba(0,0,0,.055) 1px, transparent 1px);background-size:var(--grid-size) var(--grid-size);cursor:default}
+#world{position:absolute;left:0;top:0;transform-origin:0 0}
 .item{position:absolute;user-select:none;touch-action:none}
-.item.editable{cursor:grab}
-.item.dragging{cursor:grabbing}
-.text-item{background:transparent;white-space:pre-wrap;overflow:hidden;padding:34px 10px 8px;line-height:1.05;font-weight:500}
-.image-item{overflow:visible}
-.image-item img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
-.audio-item{background:rgba(255,255,255,.92);padding:34px 10px 10px;box-shadow:0 10px 28px rgba(0,0,0,.08)}
+.item.editable{cursor:move}
+.text-item{background:transparent;white-space:pre-wrap;overflow:hidden;padding:34px 8px 4px 8px;line-height:1.05;border:0;box-shadow:none;font-weight:400}
+.image-item{overflow:visible!important}.image-item img{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
+.audio-item{background:#fff;padding:34px 8px 8px 8px;overflow:visible!important}
 .audio-item audio{width:100%}
-.draw-item svg{width:100%;height:100%;display:block;overflow:visible}
-.tag{position:absolute;right:4px;bottom:3px;font-size:10px;color:#999;background:rgba(255,255,255,.78);padding:1px 5px;border-radius:8px}
-
-.minibar{position:absolute;left:5px;top:5px;display:none;gap:4px;z-index:999;background:rgba(255,255,255,.92);backdrop-filter:blur(12px);padding:4px;border-radius:12px;box-shadow:0 10px 28px rgba(0,0,0,.12)}
-.item.editable:hover .minibar,.minibar:hover{display:flex}
-.minibar button{border:0;background:#111;color:#fff;border-radius:9px;font-size:11px;font-weight:800;padding:6px 8px}
-
-#tools{position:fixed;left:14px;top:50%;transform:translateY(-50%);z-index:100;display:flex;flex-direction:column;gap:8px;pointer-events:auto}
-.tool{width:46px;height:46px;border:0;border-radius:16px;background:rgba(255,255,255,.90);backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.12);font-weight:900;font-size:16px}
-.tool.active{background:#111;color:white}
-.tool.danger{background:#ffe7e7;color:#c80000}
-
-#palette{position:fixed;left:72px;top:50%;transform:translateY(-50%);z-index:100;display:none;gap:8px;background:rgba(255,255,255,.92);backdrop-filter:blur(18px);box-shadow:0 12px 36px rgba(0,0,0,.12);padding:10px;border-radius:18px}
-#palette.show{display:flex}
-.dot{width:26px;height:26px;border:2px solid rgba(0,0,0,.15);border-radius:50%;box-shadow:0 4px 14px rgba(0,0,0,.08)}
-.dot.active{outline:3px solid #111;outline-offset:2px}
-
-.fileInput{position:fixed;left:-9999px;top:-9999px;opacity:0;width:1px;height:1px}
-
-#authOverlay{position:fixed;inset:0;z-index:200;background:linear-gradient(135deg,#f7f7f7,#ffffff);display:flex;align-items:center;justify-content:center;padding:18px}
-.card{width:min(410px,94vw);background:rgba(255,255,255,.88);backdrop-filter:blur(24px);box-shadow:0 28px 90px rgba(0,0,0,.15);border-radius:28px;padding:20px}
-.card h1{margin:0 0 14px;font-size:28px;letter-spacing:-.03em}
-.card p{margin:0 0 16px;color:#666;font-size:14px}
-.card input,.card textarea{width:100%;border:0;background:#f1f1f1;outline:0;padding:12px 13px;border-radius:14px;margin:6px 0}
-.btn{border:0;background:#111;color:white;border-radius:14px;padding:12px 14px;font-weight:900;margin-top:8px}
-.btn2{border:0;background:#eee;color:#111;border-radius:14px;padding:12px 14px;font-weight:900;margin-top:8px}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-
-#settingsOverlay{position:fixed;inset:0;z-index:160;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:none;align-items:center;justify-content:center;padding:18px}
-
-#toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:250;display:flex;flex-direction:column;gap:6px}
-.msg{background:#111;color:#fff;padding:10px 13px;border-radius:14px;font-size:13px;box-shadow:0 12px 40px rgba(0,0,0,.18)}
-
-.draft{position:absolute;width:360px;height:140px;background:transparent;border:2px dashed #111;border-radius:10px;z-index:9999;box-shadow:0 20px 70px rgba(0,0,0,.12)}
-.draft textarea{position:absolute;inset:0;width:100%;height:100%;border:0;background:transparent;outline:0;resize:none;padding:42px 12px 10px;line-height:1.05;font-size:52px;font-weight:500}
-.draftbar{position:absolute;left:6px;top:6px;display:flex;gap:5px;z-index:3}
-.draftbar button{border:0;border-radius:9px;background:#111;color:#fff;padding:6px 8px;font-size:11px;font-weight:900}
-.handle{position:absolute;width:14px;height:14px;background:#fff;border:2px solid #111;border-radius:50%;z-index:4}
-.handle.br{right:-8px;bottom:-8px;cursor:nwse-resize}
-
-@media(max-width:600px){
-    #tools{left:9px}
-    .tool{width:42px;height:42px;border-radius:14px}
-    #palette{left:60px}
-}
-
-#NO_ROUND_FORCE{}
-*,button,input,.item,.itemBar,#tools,#settings,#auth,.authBox,.btn,.btn2{border-radius:0!important;box-shadow:none!important}
+.draw-item{overflow:visible!important}.draw-item svg{width:100%;height:100%;display:block;overflow:visible}
+.tag{position:absolute;right:3px;bottom:2px;font-size:10px;color:#aaa;background:rgba(255,255,255,.65);padding:1px 4px}
+.toolbar{position:absolute;left:6px;top:6px;display:none;gap:4px;z-index:99999;background:rgba(255,255,255,.86);padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.10)}
+.item.editable:hover .toolbar,.toolbar:hover{display:flex}
+.toolbar button{border:0;background:#111;color:#fff;font-size:11px;padding:6px 7px;cursor:pointer}
+#drawCanvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:none;z-index:9000;cursor:crosshair;pointer-events:none}
+body.draw-mode #drawCanvas{display:block;pointer-events:none}
+#tools{position:fixed;z-index:20000;pointer-events:auto;left:14px;top:50%;transform:translateY(-50%) scale(var(--ui-scale));transform-origin:left center;display:flex;flex-direction:column;gap:8px}
+.tool{pointer-events:auto;width:44px;height:44px;border:0;background:rgba(255,255,255,.78);backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.08);font-weight:900;font-size:16px}
+.tool.active{background:#111;color:#fff}
+.panel{position:fixed;z-index:19990;pointer-events:auto;left:66px;top:50%;transform:translateY(-50%) scale(var(--ui-scale));transform-origin:left center;width:auto;background:rgba(255,255,255,.78);backdrop-filter:blur(22px);box-shadow:0 20px 60px rgba(0,0,0,.10);padding:8px;display:none}
+.panel.show{display:flex;gap:8px;align-items:center}
+label{display:block;font-size:11px;font-weight:800;color:#777;margin:8px 0 5px}
+input,textarea{width:100%;border:0;background:rgba(240,240,240,.75);outline:0;padding:9px}
+textarea{min-height:90px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.draft-wrap{position:absolute;width:360px;height:130px;background:transparent;border:2px dashed #111;z-index:9997;box-shadow:none;overflow:visible}
+.draft-input{position:absolute;inset:0;width:100%;height:100%;border:0!important;background:transparent!important;outline:0;resize:none;overflow:hidden;padding:10px 14px;line-height:1.05;font-size:58px;font-weight:400;color:#111111;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Arial,sans-serif}
+.draft-input::placeholder{color:rgba(0,0,0,.25)}
+.draft-handle{position:absolute;width:11px;height:11px;background:#fff;border:2px solid #111;z-index:9999}
+.draft-handle.tl{left:-7px;top:-7px;cursor:nwse-resize}.draft-handle.tm{left:50%;top:-7px;transform:translateX(-50%);cursor:ns-resize}.draft-handle.tr{right:-7px;top:-7px;cursor:nesw-resize}
+.draft-handle.ml{left:-7px;top:50%;transform:translateY(-50%);cursor:ew-resize}.draft-handle.mr{right:-7px;top:50%;transform:translateY(-50%);cursor:ew-resize}
+.draft-handle.bl{left:-7px;bottom:-7px;cursor:nesw-resize}.draft-handle.bm{left:50%;bottom:-7px;transform:translateX(-50%);cursor:ns-resize}.draft-handle.br{right:-7px;bottom:-7px;cursor:nwse-resize}
+.color-dot{width:24px;height:24px;border-radius:50%;border:2px solid rgba(0,0,0,.14);box-shadow:0 4px 14px rgba(0,0,0,.08);cursor:pointer}
+.color-dot.active{outline:3px solid #111;outline-offset:2px}
+.btn{border:0;background:#111;color:white;padding:10px 12px;font-weight:800;margin-top:8px}
+.btn2{border:0;background:#eee;color:#111;padding:10px 12px;font-weight:800;margin-top:8px}
+#loginOverlay{position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:flex;align-items:center;justify-content:center}
+#loginBox{width:min(390px,92vw);background:rgba(255,255,255,.82);backdrop-filter:blur(26px);box-shadow:0 30px 100px rgba(0,0,0,.14);padding:18px}
+#settingsOverlay{position:fixed;inset:0;z-index:10060;background:rgba(255,255,255,.35);backdrop-filter:blur(16px);display:none;align-items:center;justify-content:center}
+.hidden{display:none!important}
+.msg{position:fixed;z-index:1000;top:12px;left:50%;transform:translateX(-50%);background:#111;color:white;padding:9px 12px;font-size:13px}
 </style>
 </head>
 <body>
 
-<div id="board">
-    <div id="world"></div>
-    <canvas id="drawCanvas"></canvas>
-</div>
-
-<div id="toast">
 {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
         {% for category,message in messages %}
@@ -697,684 +695,792 @@ body.draw-on #drawCanvas{display:block}
         {% endfor %}
     {% endif %}
 {% endwith %}
+
+<div id="viewport">
+    <div id="world"></div>
+    <canvas id="drawCanvas"></canvas>
 </div>
 
 {% if user %}
 <div id="tools">
-    <button type="button" class="tool active" data-tool="text" onclick="createTextBox()" title="Text">T</button>
-    <button type="button" class="tool" data-tool="image" onclick="pickImage()" title="Image">◎</button>
-    <button type="button" class="tool" data-tool="audio" onclick="pickAudio()" title="Audio">♫</button>
-    <button type="button" class="tool" data-tool="draw" onclick="toggleDraw()" title="Draw">✎</button>
-    <button type="button" class="tool" onclick="openSettings()" title="Settings">⚙</button>
+    <button class="tool active" data-tool="text" onclick="createTextBox()">T</button>
+    <button class="tool" data-tool="image" onclick="pickImage()">◎</button>
+    <button class="tool" data-tool="audio" onclick="pickAudio()">♫</button>
+    <button class="tool" data-tool="draw" onclick="toggleDrawPalette()">✎</button>
+    <button class="tool" onclick="zoomOut()" title="zoom out">−</button>
+    <button class="tool" onclick="zoomIn()" title="zoom in">+</button>
+    <button class="tool" onclick="resetCamera()" title="center">⌂</button>
+    <button class="tool" onclick="openSettings()">⚙</button>
 </div>
 
-<div id="palette">
-    <button type="button" class="dot active" style="background:#111111" onclick="selectColor('#111111',this)"></button>
-    <button type="button" class="dot" style="background:#ff3b30" onclick="selectColor('#ff3b30',this)"></button>
-    <button type="button" class="dot" style="background:#ff9500" onclick="selectColor('#ff9500',this)"></button>
-    <button type="button" class="dot" style="background:#ffcc00" onclick="selectColor('#ffcc00',this)"></button>
-    <button type="button" class="dot" style="background:#34c759" onclick="selectColor('#34c759',this)"></button>
-    <button type="button" class="dot" style="background:#007aff" onclick="selectColor('#007aff',this)"></button>
-    <button type="button" class="dot" style="background:#af52de" onclick="selectColor('#af52de',this)"></button>
-</div>
+<form id="imageForm" action="{{ url_for('add_image') }}" method="POST" enctype="multipart/form-data" class="hidden">
+    <input name="x" id="imageX" type="hidden">
+    <input name="y" id="imageY" type="hidden">
+    <input id="imagePicker" name="image" type="file" accept=".png,.jpg,.jpeg,.gif,.webp">
+</form>
 
-<input id="imagePicker" class="fileInput" type="file" accept=".png,.jpg,.jpeg,.gif,.webp">
-<input id="audioPicker" class="fileInput" type="file" accept=".mp3,.wav,.ogg,.m4a">
+<form id="audioForm" action="{{ url_for('add_audio') }}" method="POST" enctype="multipart/form-data" class="hidden">
+    <input name="x" id="audioX" type="hidden">
+    <input name="y" id="audioY" type="hidden">
+    <input id="audioPicker" name="audio" type="file" accept=".mp3,.wav,.ogg,.m4a">
+</form>
+
+<div id="panel-draw" class="panel">
+    <button class="color-dot active" style="background:#111111" onclick="selectDrawColor('#111111', this)"></button>
+    <button class="color-dot" style="background:#ff3b30" onclick="selectDrawColor('#ff3b30', this)"></button>
+    <button class="color-dot" style="background:#ff9500" onclick="selectDrawColor('#ff9500', this)"></button>
+    <button class="color-dot" style="background:#ffcc00" onclick="selectDrawColor('#ffcc00', this)"></button>
+    <button class="color-dot" style="background:#34c759" onclick="selectDrawColor('#34c759', this)"></button>
+    <button class="color-dot" style="background:#007aff" onclick="selectDrawColor('#007aff', this)"></button>
+    <button class="color-dot" style="background:#af52de" onclick="selectDrawColor('#af52de', this)"></button>
+</div>
 
 <div id="settingsOverlay">
-    <div class="card">
-        <h1>settings</h1>
+    <div id="loginBox">
         <form action="{{ url_for('settings') }}" method="POST">
+            <label>name</label>
             <input name="username" value="{{ user.username }}" required>
-            <div class="row">
-                <button type="submit" class="btn">save</button>
-                <button type="button" class="btn2" onclick="closeSettings()">cancel</button>
-                <a class="btn2" style="text-decoration:none" href="{{ url_for('logout') }}">logout</a>
-            </div>
+            <button class="btn" type="submit">save</button>
+            <button class="btn2" type="button" onclick="closeSettings()">cancel</button>
         </form>
     </div>
 </div>
 {% endif %}
 
 {% if not user %}
-<div id="authOverlay">
-    <div class="card">
-        <h1>{{ app_name }}</h1>
-        <p>Login or create an account. No email verification.</p>
-
+<div id="loginOverlay">
+    <div id="loginBox">
         <form id="registerBox" action="{{ url_for('register') }}" method="POST">
-            <input name="username" placeholder="username" required>
+            <input name="username" placeholder="your name.." required>
+            <br><br>
             <input name="email" type="email" placeholder="email" required>
+            <br><br>
             <input name="password" type="password" placeholder="password" required>
-            <div class="row">
-                <button type="submit" class="btn">create</button>
-                <button type="button" class="btn2" onclick="showAuth('login')">login</button>
-            </div>
+            <button class="btn" type="submit">create</button>
+            <button class="btn2" type="button" onclick="showAuth('login')">login</button>
         </form>
 
         <form id="loginBoxForm" class="hidden" action="{{ url_for('login') }}" method="POST">
-            <input name="email_or_user" placeholder="email or username" required>
+            <input name="email_or_user" placeholder="email or name" required>
+            <br><br>
             <input name="password" type="password" placeholder="password" required>
-            <div class="row">
-                <button type="submit" class="btn">login</button>
-                <button type="button" class="btn2" onclick="showAuth('register')">create</button>
-            </div>
+            <button class="btn" type="submit">login</button>
+            <button class="btn2" type="button" onclick="showAuth('register')">create</button>
         </form>
     </div>
 </div>
 {% endif %}
 
 <script>
-const LOGGED_IN = {{ "true" if user else "false" }};
+// Always start at world position 0,0 when the site opens.
+let camera = {x: 0, y: 0};
 
-let camera = {
-    x: Number(localStorage.getItem("camX") || 0),
-    y: Number(localStorage.getItem("camY") || 0)
-};
+// Board zoom only. Browser/tool zoom stays unchanged.
+let zoom = 1;
+const MIN_ZOOM = 0.35;
+const MAX_ZOOM = 1.75;
+const GRID_BASE = 42;
 
-let selectedColor = "#111111";
-let drawSize = 4;
-let drawMode = false;
+try{
+    localStorage.removeItem("camX");
+    localStorage.removeItem("camY");
+    localStorage.removeItem("zoom");
+}catch(e){}
+
 let loaded = new Map();
 let loading = false;
 let lastLoadKey = "";
-let loadTimer = null;
-
-const board = document.getElementById("board");
+const viewport = document.getElementById("viewport");
 const world = document.getElementById("world");
-const canvas = document.getElementById("drawCanvas");
-const ctx = canvas ? canvas.getContext("2d") : null;
 
-function escapeHtml(s){
-    return String(s || "")
-        .replaceAll("&","&amp;")
-        .replaceAll("<","&lt;")
-        .replaceAll(">","&gt;")
-        .replaceAll('"',"&quot;")
-        .replaceAll("'","&#039;");
+function updateZoomCompensation(){
+    // If browser zoom is accidentally set very high, keep tools/grid usable.
+    // This cannot change the browser's real zoom UI, but it normalizes the app UI.
+    let ratio = 1;
+    try{
+        if(window.outerWidth && window.innerWidth){
+            ratio = Math.max(1, window.outerWidth / window.innerWidth);
+        }
+    }catch(e){ ratio = 1; }
+
+    const scale = Math.max(0.20, Math.min(1, 1 / ratio));
+    const grid = Math.max(8, Math.round(42 * scale));
+
+    document.documentElement.style.setProperty("--ui-scale", String(scale));
+    document.documentElement.style.setProperty("--grid-size", grid + "px");
+}
+updateZoomCompensation();
+window.addEventListener("resize", updateZoomCompensation);
+
+function clampZoom(value){
+    return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
 }
 
 function screenToWorld(sx, sy){
     return {
-        x: Math.round(sx - camera.x),
-        y: Math.round(sy - camera.y)
+        x: Math.round((sx - camera.x) / zoom),
+        y: Math.round((sy - camera.y) / zoom)
     };
 }
 
 function centerWorld(){
-    return screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
+    return screenToWorld(window.innerWidth/2, window.innerHeight/2);
+}
+function fillCenter(xid,yid){
+    const p = centerWorld();
+    const x = document.getElementById(xid);
+    const y = document.getElementById(yid);
+    if(x) x.value = p.x;
+    if(y) y.value = p.y;
 }
 
+function pickImage(){
+    setActiveTool("image");
+    hidePanels();
+    fillCenter("imageX","imageY");
+    document.getElementById("imagePicker").click();
+}
+function pickAudio(){
+    setActiveTool("audio");
+    hidePanels();
+    fillCenter("audioX","audioY");
+    document.getElementById("audioPicker").click();
+}
+document.addEventListener("change", e=>{
+    if(e.target && e.target.id === "imagePicker" && e.target.files.length){
+        uploadPickedFile("image");
+    }
+    if(e.target && e.target.id === "audioPicker" && e.target.files.length){
+        uploadPickedFile("audio");
+    }
+});
+
+async function uploadPickedFile(kind){
+    const isImage = kind === "image";
+    const picker = document.getElementById(isImage ? "imagePicker" : "audioPicker");
+    const xInput = document.getElementById(isImage ? "imageX" : "audioX");
+    const yInput = document.getElementById(isImage ? "imageY" : "audioY");
+
+    if(!picker || !picker.files || !picker.files.length) return;
+
+    const p = centerWorld();
+    if(xInput) xInput.value = p.x;
+    if(yInput) yInput.value = p.y;
+
+    const form = new FormData();
+    form.append(isImage ? "image" : "audio", picker.files[0]);
+    form.append("x", p.x);
+    form.append("y", p.y);
+
+    picker.value = "";
+
+    try{
+        const res = await fetch(isImage ? "/api/add-image" : "/api/add-audio", {
+            method: "POST",
+            body: form
+        });
+
+        let out = {};
+        try{ out = await res.json(); }catch(e){}
+
+        if(!res.ok || out.ok === false){
+            alert(out.error || "upload failed");
+            return;
+        }
+
+        if(out.item && !loaded.has(out.item.id)){
+            loaded.set(out.item.id, out.item);
+            world.insertAdjacentHTML("beforeend", itemHtml(out.item));
+            const el = document.getElementById("item-" + out.item.id);
+            if(el && out.item.type === "text"){
+                el.querySelector("[data-text-body]").textContent = out.item.text || "";
+            }
+            bindDragging();
+        }
+
+        lastLoadKey = "";
+        setTimeout(loadViewport, 250);
+    }catch(err){
+        alert("upload failed");
+    }
+}
+
+let draftBox = null;
+let draftInput = null;
+let draftSaveLock = false;
+
+function createTextBox(){
+    setActiveTool("text");
+    hidePanels();
+    if(draftBox) return;
+
+    const p = centerWorld();
+
+    const box = document.createElement("div");
+    box.className = "draft-wrap";
+    box.style.left = p.x + "px";
+    box.style.top = p.y + "px";
+    box.style.width = "360px";
+    box.style.height = "130px";
+
+    const input = document.createElement("textarea");
+    input.className = "draft-input";
+    input.placeholder = "text box";
+    input.maxLength = 300;
+    input.spellcheck = false;
+    input.style.color = selectedDrawColor || "#111111";
+
+    box.appendChild(input);
+
+    ["tl","tm","tr","ml","mr","bl","bm","br"].forEach(pos=>{
+        const h = document.createElement("span");
+        h.className = "draft-handle " + pos;
+        h.dataset.handle = pos;
+        h.addEventListener("mousedown", startDraftResize);
+        box.appendChild(h);
+    });
+
+    world.appendChild(box);
+    draftBox = box;
+    draftInput = input;
+    input.focus();
+
+    input.addEventListener("keydown", e=>{
+        if(e.key === "Enter" && (e.ctrlKey || e.metaKey)){
+            e.preventDefault();
+            saveDraftText();
+        }
+        if(e.key === "Escape"){
+            e.preventDefault();
+            cancelDraftText();
+        }
+    });
+}
+
+function cancelDraftText(){
+    if(draftBox){
+        draftBox.remove();
+        draftBox = null;
+        draftInput = null;
+    }
+}
+
+function draftCleanText(){
+    if(!draftInput) return "";
+    return draftInput.value.trim().slice(0,300);
+}
+
+async function saveDraftText(){
+    if(!draftBox || !draftInput || draftSaveLock) return;
+
+    const txt = draftCleanText();
+    if(!txt){
+        cancelDraftText();
+        return;
+    }
+
+    draftSaveLock = true;
+
+    const data = {
+        text: txt,
+        color: selectedDrawColor || "#111111",
+        x: parseInt(draftBox.style.left || "0"),
+        y: parseInt(draftBox.style.top || "0"),
+        w: Math.max(120, Math.min(700, Math.round(draftBox.offsetWidth))),
+        h: Math.max(70, Math.min(300, Math.round(draftBox.offsetHeight)))
+    };
+
+    const out = await postJson("/api/add-text-box", data);
+
+    if(out && out.ok){
+        cancelDraftText();
+
+        if(out.item && !loaded.has(out.item.id)){
+            loaded.set(out.item.id, out.item);
+            world.insertAdjacentHTML("beforeend", itemHtml(out.item));
+            const el = document.getElementById("item-" + out.item.id);
+            if(el && out.item.type === "text"){
+                el.querySelector("[data-text-body]").textContent = out.item.text || "";
+            }
+            bindDragging();
+        }
+
+        lastLoadKey = "";
+        setTimeout(loadViewport, 250);
+    }
+
+    draftSaveLock = false;
+}
+
+let draftResize = null;
+
+function startDraftResize(e){
+    if(!draftBox) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    draftResize = {
+        handle: e.target.dataset.handle || "br",
+        x: e.clientX,
+        y: e.clientY,
+        left: parseInt(draftBox.style.left || "0"),
+        top: parseInt(draftBox.style.top || "0"),
+        w: draftBox.offsetWidth,
+        h: draftBox.offsetHeight
+    };
+}
+
+document.addEventListener("mousemove", e=>{
+    if(!draftResize || !draftBox) return;
+
+    let dx = e.clientX - draftResize.x;
+    let dy = e.clientY - draftResize.y;
+
+    let left = draftResize.left;
+    let top = draftResize.top;
+    let w = draftResize.w;
+    let h = draftResize.h;
+
+    const handle = draftResize.handle;
+
+    if(handle.includes("r")) w = draftResize.w + dx;
+    if(handle.includes("l")){
+        w = draftResize.w - dx;
+        left = draftResize.left + dx;
+    }
+
+    if(handle.includes("b")) h = draftResize.h + dy;
+    if(handle.includes("t")){
+        h = draftResize.h - dy;
+        top = draftResize.top + dy;
+    }
+
+    w = Math.max(120, Math.min(700, w));
+    h = Math.max(70, Math.min(300, h));
+
+    draftBox.style.left = left + "px";
+    draftBox.style.top = top + "px";
+    draftBox.style.width = w + "px";
+    draftBox.style.height = h + "px";
+});
+
+document.addEventListener("mouseup", ()=>{
+    draftResize = null;
+});
+
+document.addEventListener("mousedown", e=>{
+    if(draftBox && !draftBox.contains(e.target) && !e.target.closest("#tools")){
+        saveDraftText();
+    }
+}, true);
+
 function applyCamera(){
-    world.style.transform = `translate(${camera.x}px, ${camera.y}px)`;
-    board.style.backgroundPosition = `${camera.x}px ${camera.y}px`;
-    localStorage.setItem("camX", String(camera.x));
-    localStorage.setItem("camY", String(camera.y));
+    world.style.transform = `translate(${camera.x}px, ${camera.y}px) scale(${zoom})`;
+    viewport.style.backgroundPosition = `${camera.x}px ${camera.y}px`;
+    viewport.style.backgroundSize = `${GRID_BASE * zoom}px ${GRID_BASE * zoom}px`;
     scheduleLoad();
 }
 
+function zoomAt(screenX, screenY, nextZoom){
+    const before = screenToWorld(screenX, screenY);
+    const newZoom = clampZoom(nextZoom);
+
+    if(Math.abs(newZoom - zoom) < 0.001) return;
+
+    zoom = newZoom;
+    camera.x = screenX - before.x * zoom;
+    camera.y = screenY - before.y * zoom;
+
+    applyCamera();
+    loadViewport();
+}
+
+function zoomIn(){
+    zoomAt(window.innerWidth / 2, window.innerHeight / 2, zoom * 1.18);
+}
+
+function zoomOut(){
+    zoomAt(window.innerWidth / 2, window.innerHeight / 2, zoom / 1.18);
+}
+
+function resetCamera(){
+    camera.x = 0;
+    camera.y = 0;
+    zoom = 1;
+    lastLoadKey = "";
+    applyCamera();
+    loadViewport();
+}
+
+applyCamera();
+
 function setActiveTool(name){
-    document.querySelectorAll(".tool").forEach(b => b.classList.remove("active"));
-    const btn = document.querySelector(`[data-tool="${name}"]`);
-    if(btn) btn.classList.add("active");
     if(name !== "draw"){
         drawMode = false;
-        document.body.classList.remove("draw-on");
-        const p = document.getElementById("palette");
-        if(p) p.classList.remove("show");
+        document.body.classList.remove("draw-mode");
     }
+    document.querySelectorAll(".tool").forEach(x=>x.classList.remove("active"));
+    const b = document.querySelector(`[data-tool="${name}"]`);
+    if(b) b.classList.add("active");
 }
-
+function hidePanels(){
+    document.querySelectorAll(".panel").forEach(x=>x.classList.remove("show"));
+}
 function showAuth(which){
-    const r = document.getElementById("registerBox");
-    const l = document.getElementById("loginBoxForm");
-    if(r) r.classList.toggle("hidden", which !== "register");
-    if(l) l.classList.toggle("hidden", which !== "login");
+    document.getElementById("registerBox").classList.toggle("hidden", which !== "register");
+    document.getElementById("loginBoxForm").classList.toggle("hidden", which !== "login");
 }
+function openSettings(){ document.getElementById("settingsOverlay").style.display="flex"; }
+function closeSettings(){ document.getElementById("settingsOverlay").style.display="none"; }
 
-function openSettings(){
-    const el = document.getElementById("settingsOverlay");
-    if(el) el.style.display = "flex";
-}
+let panning=false, panStart={x:0,y:0}, camStart={x:0,y:0};
+viewport.addEventListener("contextmenu", e=>e.preventDefault());
 
-function closeSettings(){
-    const el = document.getElementById("settingsOverlay");
-    if(el) el.style.display = "none";
-}
+// Block browser zoom cheating: Ctrl/Cmd + wheel and Ctrl/Cmd + + - 0.
+// Normal wheel only moves the board camera, so UI/tool size stays unchanged.
+window.addEventListener("wheel", e=>{
+    const typing = e.target && (
+        e.target.tagName === "TEXTAREA" ||
+        e.target.tagName === "INPUT" ||
+        e.target.isContentEditable
+    );
 
-async function postJson(url, data){
-    try{
-        const res = await fetch(url, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify(data || {})
-        });
-        let out = {};
-        try{ out = await res.json(); }catch(e){}
-        if(!res.ok || out.ok === false){
-            alert(out.error || "failed");
-            return null;
-        }
-        return out;
-    }catch(e){
-        alert("network failed");
-        return null;
+    if(typing) return;
+
+    if(e.ctrlKey || e.metaKey){
+        e.preventDefault();
+        const factor = e.deltaY > 0 ? 0.88 : 1.12;
+        zoomAt(e.clientX, e.clientY, zoom * factor);
+        return;
     }
-}
+
+    e.preventDefault();
+
+    camera.x -= e.deltaX;
+    camera.y -= e.deltaY;
+
+    if(e.shiftKey){
+        camera.x -= e.deltaY;
+        camera.y += e.deltaY;
+    }
+
+    applyCamera();
+}, {passive:false});
+
+window.addEventListener("keydown", e=>{
+    const key = String(e.key || "").toLowerCase();
+
+    if((e.ctrlKey || e.metaKey) && ["+","=","-","_","0"].includes(key)){
+        e.preventDefault();
+        return false;
+    }
+}, {capture:true});
+
+window.addEventListener("keydown", e=>{
+    if(e.key === "Escape"){
+        drawMode = false;
+        drawing = false;
+        document.body.classList.remove("draw-mode");
+        hidePanels();
+        if(canvas && ctx) ctx.clearRect(0,0,canvas.width,canvas.height);
+    }
+}, {capture:true});
+
+["gesturestart","gesturechange","gestureend"].forEach(name=>{
+    window.addEventListener(name, e=>e.preventDefault(), {passive:false});
+});
+
+viewport.addEventListener("mousedown", e=>{
+    if(e.button !== 2) return;
+    panning=true;
+    panStart={x:e.clientX,y:e.clientY};
+    camStart={x:camera.x,y:camera.y};
+    viewport.style.cursor="grabbing";
+});
+document.addEventListener("mousemove", e=>{
+    if(!panning) return;
+    camera.x = camStart.x + (e.clientX-panStart.x);
+    camera.y = camStart.y + (e.clientY-panStart.y);
+    applyCamera();
+});
+document.addEventListener("mouseup", ()=>{
+    if(panning){
+        panning=false;
+        viewport.style.cursor="default";
+        loadViewport();
+    }
+});
 
 function itemHtml(item){
     const editable = item.can_edit ? " editable" : "";
-    const style = `left:${item.x}px;top:${item.y}px;width:${item.w}px;height:${item.h}px;z-index:${item.z};`;
-    let bar = "";
+    let html = "";
+    let style = `left:${item.x}px;top:${item.y}px;width:${item.w}px;height:${item.h}px;z-index:${item.z};`;
+
+    let toolbar = "";
     if(item.can_edit){
-        const edit = item.type === "text" ? `<button type="button" onclick="editText('${item.id}')">edit</button>` : "";
-        bar = `<div class="minibar">${edit}<button type="button" onclick="resizeItem('${item.id}',30)">+</button><button type="button" onclick="resizeItem('${item.id}',-30)">-</button><button type="button" onclick="layerItem('${item.id}',1)">front</button><button type="button" onclick="layerItem('${item.id}',-1)">back</button><button type="button" onclick="deleteItem('${item.id}')">del</button></div>`;
+        const edit = item.type === "text" ? `<button onclick="editText('${item.id}')">edit</button>` : "";
+        toolbar = `<div class="toolbar">${edit}<button onclick="resizeItem('${item.id}',25)">+</button><button onclick="resizeItem('${item.id}',-25)">-</button><button onclick="layerItem('${item.id}',1)">front</button><button onclick="layerItem('${item.id}',-1)">back</button><button onclick="deleteItem('${item.id}')">del</button></div>`;
     }
 
     if(item.type === "text"){
-        return `<div id="item-${item.id}" class="item text-item${editable}" data-id="${item.id}" style="${style}color:${item.color};font-size:${item.font}px;">${bar}<div data-text-body></div><div class="tag">@${escapeHtml(item.username)}</div></div>`;
-    }
-
-    if(item.type === "image"){
-        return `<div id="item-${item.id}" class="item image-item${editable}" data-id="${item.id}" style="${style}">${bar}<img src="${item.file_url}?v=${item.created || Date.now()}" onerror="this.style.display='none';this.parentElement.insertAdjacentHTML('beforeend','<div style=&quot;font-size:12px;color:#999;padding:12px;background:#fff&quot;>image failed</div>')"><div class="tag">@${escapeHtml(item.username)}</div></div>`;
-    }
-
-    if(item.type === "audio"){
-        return `<div id="item-${item.id}" class="item audio-item${editable}" data-id="${item.id}" style="${style}">${bar}<audio controls preload="none" src="${item.file_url}"></audio><div class="tag">@${escapeHtml(item.username)}</div></div>`;
-    }
-
-    const pts = (item.points || []).map(p => `${p.x},${p.y}`).join(" ");
-    return `<div id="item-${item.id}" class="item draw-item${editable}" data-id="${item.id}" style="${style}">${bar}<svg viewBox="0 0 ${item.w} ${item.h}" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${item.stroke}" stroke-width="${item.stroke_width}" stroke-linecap="round" stroke-linejoin="round"/></svg><div class="tag">@${escapeHtml(item.username)}</div></div>`;
-}
-
-function addOrUpdateItem(item){
-    loaded.set(item.id, item);
-    let el = document.getElementById("item-" + item.id);
-
-    if(!el){
-        world.insertAdjacentHTML("beforeend", itemHtml(item));
-        el = document.getElementById("item-" + item.id);
+        const bg = item.bg || "transparent";
+        style += `background:${bg};color:${item.color};font-size:${item.font}px;`;
+        html = `<div id="item-${item.id}" class="item text-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<div data-text-body></div><div class="tag">@${escapeHtml(item.username)}</div></div>`;
+    }else if(item.type === "image"){
+        html = `<div id="item-${item.id}" class="item image-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<img src="${item.file_url}?v=${item.created || Date.now()}" onload="this.dataset.ok='1'" onerror="this.style.display='none'; this.parentElement.insertAdjacentHTML('beforeend', '<div style=&quot;font-size:12px;color:#999;padding:8px&quot;>image loading failed</div>')"><div class="tag">@${escapeHtml(item.username)}</div></div>`;
+    }else if(item.type === "audio"){
+        html = `<div id="item-${item.id}" class="item audio-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<audio controls preload="none" src="${item.file_url}"></audio><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }else{
-        el.style.left = item.x + "px";
-        el.style.top = item.y + "px";
-        el.style.width = item.w + "px";
-        el.style.height = item.h + "px";
-        el.style.zIndex = item.z;
+        const pts = (item.points || []).map(p=>`${p.x},${p.y}`).join(" ");
+        html = `<div id="item-${item.id}" class="item draw-item${editable}" data-id="${item.id}" style="${style}">${toolbar}<svg viewBox="0 0 ${item.w} ${item.h}" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${item.stroke}" stroke-width="${item.stroke_width}" stroke-linecap="round" stroke-linejoin="round"/></svg><div class="tag">@${escapeHtml(item.username)}</div></div>`;
     }
-
-    if(el && item.type === "text"){
-        const body = el.querySelector("[data-text-body]");
-        if(body) body.textContent = item.text || "";
-    }
+    return html;
+}
+function escapeHtml(s){
+    return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
 }
 
 function unloadFarItems(){
-    const left = -camera.x - 2500;
-    const top = -camera.y - 2500;
-    const right = -camera.x + window.innerWidth + 2500;
-    const bottom = -camera.y + window.innerHeight + 2500;
-
+    const left = (-camera.x / zoom) - 2200;
+    const top = (-camera.y / zoom) - 2200;
+    const right = (-camera.x / zoom) + (window.innerWidth / zoom) + 2200;
+    const bottom = (-camera.y / zoom) + (window.innerHeight / zoom) + 2200;
     for(const [id,item] of loaded.entries()){
         if(item.x + item.w < left || item.x > right || item.y + item.h < top || item.y > bottom){
-            const el = document.getElementById("item-" + id);
+            const el = document.getElementById("item-"+id);
             if(el) el.remove();
             loaded.delete(id);
         }
     }
 }
 
+let loadTimer = null;
 function scheduleLoad(){
-    if(!LOGGED_IN) return;
     clearTimeout(loadTimer);
     loadTimer = setTimeout(loadViewport, 120);
 }
-
-async function loadViewport(force=false){
-    if(!LOGGED_IN || loading) return;
-
-    const left = Math.round(-camera.x);
-    const top = Math.round(-camera.y);
-    const w = window.innerWidth;
-    const h = window.innerHeight;
-    const key = `${Math.floor(left/600)}:${Math.floor(top/600)}:${Math.floor(w/400)}:${Math.floor(h/400)}`;
-
-    if(!force && key === lastLoadKey) return;
+async function loadViewport(){
+    if(loading) return;
+    const left = Math.round(-camera.x / zoom);
+    const top = Math.round(-camera.y / zoom);
+    const w = Math.ceil(window.innerWidth / zoom);
+    const h = Math.ceil(window.innerHeight / zoom);
+    const key = `${Math.floor(left/700)}:${Math.floor(top/700)}:${Math.floor(w/500)}:${Math.floor(h/500)}:${Math.round(zoom*100)}`;
+    if(key === lastLoadKey) return;
     lastLoadKey = key;
     loading = true;
-
     try{
-        const res = await fetch(`/api/items?x=${left}&y=${top}&w=${w}&h=${h}`, {cache:"no-store"});
+        const res = await fetch(`/api/items?x=${left}&y=${top}&w=${w}&h=${h}`);
         const data = await res.json();
         if(data.ok){
-            data.items.forEach(addOrUpdateItem);
+            data.items.forEach(item=>{
+                if(loaded.has(item.id)){
+                    loaded.set(item.id, item);
+                    const oldEl = document.getElementById("item-" + item.id);
+                    if(oldEl){
+                        oldEl.style.left = item.x + "px";
+                        oldEl.style.top = item.y + "px";
+                        oldEl.style.width = item.w + "px";
+                        oldEl.style.height = item.h + "px";
+                        oldEl.style.zIndex = item.z;
+                    }
+                    return;
+                }
+
+                loaded.set(item.id,item);
+                world.insertAdjacentHTML("beforeend", itemHtml(item));
+                const el = document.getElementById("item-"+item.id);
+                if(item.type === "text"){
+                    el.querySelector("[data-text-body]").textContent = item.text || "";
+                }
+            });
             bindDragging();
             unloadFarItems();
         }
     }catch(e){}
-
-    loading = false;
+    loading=false;
 }
+window.addEventListener("resize", scheduleLoad);
+setInterval(()=>{ lastLoadKey=""; loadViewport(); }, 15000);
+loadViewport();
 
-let panning = false;
-let panStart = {x:0,y:0};
-let camStart = {x:0,y:0};
-
-board.addEventListener("contextmenu", e => e.preventDefault());
-
-board.addEventListener("mousedown", e => {
-    if(e.button !== 2) return;
-    if(e.target.closest("#tools,#palette,#settingsOverlay,.minibar,.draft,button,input,textarea")) return;
-    panning = true;
-    panStart = {x:e.clientX, y:e.clientY};
-    camStart = {x:camera.x, y:camera.y};
-    board.style.cursor = "grabbing";
-});
-
-document.addEventListener("mousemove", e => {
-    if(!panning) return;
-    camera.x = camStart.x + (e.clientX - panStart.x);
-    camera.y = camStart.y + (e.clientY - panStart.y);
-    applyCamera();
-});
-
-document.addEventListener("mouseup", () => {
-    if(panning){
-        panning = false;
-        board.style.cursor = "default";
-        loadViewport(true);
-    }
-});
-
-window.addEventListener("wheel", e => {
-    if(e.ctrlKey || e.metaKey){
-        e.preventDefault();
-        return;
-    }
-
-    const typing = e.target && (
-        e.target.tagName === "TEXTAREA" ||
-        e.target.tagName === "INPUT" ||
-        e.target.isContentEditable
-    );
-    if(typing) return;
-
-    e.preventDefault();
-    camera.x -= e.deltaX;
-    camera.y -= e.deltaY;
-    if(e.shiftKey){
-        camera.x -= e.deltaY;
-        camera.y += e.deltaY;
-    }
-    applyCamera();
-}, {passive:false});
-
-window.addEventListener("keydown", e => {
-    const key = String(e.key || "").toLowerCase();
-    if((e.ctrlKey || e.metaKey) && ["+","=","-","_","0"].includes(key)){
-        e.preventDefault();
-        return false;
-    }
-    if(e.key === "Escape"){
-        removeDraft();
-        drawMode = false;
-        document.body.classList.remove("draw-on");
-        const p = document.getElementById("palette");
-        if(p) p.classList.remove("show");
-        if(ctx) ctx.clearRect(0,0,canvas.width,canvas.height);
-    }
-}, {capture:true});
-
-window.addEventListener("resize", () => {
-    resizeCanvas();
-    scheduleLoad();
-});
-
-function pickImage(){
-    setActiveTool("image");
-    const picker = document.getElementById("imagePicker");
-    if(picker) picker.click();
+async function postJson(url, data){
+    const res = await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data||{})});
+    let out={};
+    try{out=await res.json();}catch(e){}
+    if(!res.ok || out.ok===false){ alert(out.error || "failed"); return null; }
+    return out;
 }
-
-function pickAudio(){
-    setActiveTool("audio");
-    const picker = document.getElementById("audioPicker");
-    if(picker) picker.click();
-}
-
-document.addEventListener("change", e => {
-    if(e.target && e.target.id === "imagePicker" && e.target.files.length){
-        uploadPicked("image", e.target.files[0]);
-        e.target.value = "";
-    }
-    if(e.target && e.target.id === "audioPicker" && e.target.files.length){
-        uploadPicked("audio", e.target.files[0]);
-        e.target.value = "";
-    }
-});
-
-async function uploadPicked(kind, file){
-    const p = centerWorld();
-    const form = new FormData();
-    form.append(kind === "image" ? "image" : "audio", file);
-    form.append("x", p.x);
-    form.append("y", p.y);
-
-    try{
-        const res = await fetch(kind === "image" ? "/api/add-image" : "/api/add-audio", {
-            method: "POST",
-            body: form
-        });
-        let out = {};
-        try{ out = await res.json(); }catch(e){}
-        if(!res.ok || out.ok === false){
-            alert(out.error || "upload failed");
-            return;
-        }
-        if(out.item) addOrUpdateItem(out.item);
-        bindDragging();
-        loadViewport(true);
-    }catch(e){
-        alert("upload failed");
-    }
-}
-
-let draft = null;
-let draftResize = null;
-
-function createTextBox(){
-    setActiveTool("text");
-    if(draft) return;
-
-    const p = centerWorld();
-    const box = document.createElement("div");
-    box.className = "draft";
-    box.style.left = p.x + "px";
-    box.style.top = p.y + "px";
-    box.style.width = "360px";
-    box.style.height = "140px";
-
-    box.innerHTML = `
-        <div class="draftbar">
-            <button type="button" data-save="1">save</button>
-            <button type="button" data-cancel="1">cancel</button>
-        </div>
-        <textarea maxlength="400" placeholder="text box"></textarea>
-        <span class="handle br"></span>
-    `;
-
-    world.appendChild(box);
-    draft = box;
-
-    const ta = box.querySelector("textarea");
-    ta.style.color = selectedColor;
-    ta.focus();
-
-    box.querySelector("[data-save]").addEventListener("click", saveDraft);
-    box.querySelector("[data-cancel]").addEventListener("click", removeDraft);
-
-    box.querySelector(".handle.br").addEventListener("mousedown", e => {
-        e.preventDefault();
-        e.stopPropagation();
-        draftResize = {
-            x:e.clientX,
-            y:e.clientY,
-            w:box.offsetWidth,
-            h:box.offsetHeight
-        };
-    });
-
-    ta.addEventListener("keydown", e => {
-        if(e.key === "Enter" && (e.ctrlKey || e.metaKey)){
-            e.preventDefault();
-            saveDraft();
-        }
-    });
-}
-
-function removeDraft(){
-    if(draft){
-        draft.remove();
-        draft = null;
-    }
-    draftResize = null;
-}
-
-document.addEventListener("mousemove", e => {
-    if(!draft || !draftResize) return;
-    const w = Math.max(140, Math.min(760, draftResize.w + (e.clientX - draftResize.x)));
-    const h = Math.max(80, Math.min(420, draftResize.h + (e.clientY - draftResize.y)));
-    draft.style.width = w + "px";
-    draft.style.height = h + "px";
-});
-
-document.addEventListener("mouseup", () => {
-    draftResize = null;
-});
-
-async function saveDraft(){
-    if(!draft) return;
-    const ta = draft.querySelector("textarea");
-    const text = (ta.value || "").trim();
-    if(!text){
-        removeDraft();
-        return;
-    }
-
-    const data = {
-        text,
-        color:selectedColor,
-        x:parseInt(draft.style.left || "0"),
-        y:parseInt(draft.style.top || "0"),
-        w:Math.round(draft.offsetWidth),
-        h:Math.round(draft.offsetHeight)
-    };
-
-    const out = await postJson("/api/add-text-box", data);
-    if(out && out.ok){
-        removeDraft();
-        if(out.item) addOrUpdateItem(out.item);
-        bindDragging();
-    }
-}
-
+function getItem(id){ return loaded.get(id); }
 function editText(id){
-    const item = loaded.get(id);
-    if(!item) return;
-    const next = prompt("edit text", item.text || "");
-    if(next === null) return;
-
-    postJson("/api/edit-text/" + id, {text:next}).then(out => {
-        if(!out) return;
-        item.text = next;
-        addOrUpdateItem(item);
+    const item=getItem(id); if(!item) return;
+    const next=prompt("edit", item.text||""); if(next===null) return;
+    postJson("/api/edit-text/"+id,{text:next}).then(out=>{
+        if(!out)return;
+        item.text=next;
+        const el=document.getElementById("item-"+id);
+        if(el) el.querySelector("[data-text-body]").textContent=next;
     });
 }
-
 function deleteItem(id){
     if(!confirm("delete?")) return;
-    postJson("/api/delete-item/" + id, {}).then(out => {
-        if(!out) return;
-        const el = document.getElementById("item-" + id);
-        if(el) el.remove();
+    postJson("/api/delete-item/"+id,{}).then(out=>{
+        if(!out)return;
+        const el=document.getElementById("item-"+id); if(el) el.remove();
         loaded.delete(id);
     });
 }
-
-let lastMoveSave = 0;
-
-function saveItemState(item, force=false){
-    const now = Date.now();
-    if(!force && now - lastMoveSave < 700) return;
-    lastMoveSave = now;
-    postJson("/api/move-item/" + item.id, {
-        x:item.x,
-        y:item.y,
-        w:item.w,
-        h:item.h,
-        z:item.z
-    });
+function resizeItem(id,delta){
+    const item=getItem(id); if(!item)return;
+    item.w=Math.max(50,Math.min(900,item.w+delta));
+    item.h=Math.max(45,Math.min(700,item.h+delta));
+    const el=document.getElementById("item-"+id);
+    if(el){el.style.width=item.w+"px";el.style.height=item.h+"px";}
+    savePos(item);
 }
-
-function resizeItem(id, delta){
-    const item = loaded.get(id);
-    if(!item) return;
-    item.w = Math.max(50, Math.min(1000, item.w + delta));
-    item.h = Math.max(45, Math.min(800, item.h + delta));
-    addOrUpdateItem(item);
-    saveItemState(item, true);
+function layerItem(id,delta){
+    const item=getItem(id); if(!item)return;
+    item.z=Math.max(1,Math.min(9999,item.z+delta));
+    const el=document.getElementById("item-"+id); if(el)el.style.zIndex=item.z;
+    savePos(item);
 }
-
-function layerItem(id, delta){
-    const item = loaded.get(id);
-    if(!item) return;
-    item.z = Math.max(1, Math.min(9999, item.z + delta * 50));
-    addOrUpdateItem(item);
-    saveItemState(item, true);
+let lastMoveSave=0;
+function savePos(item){
+    const n=Date.now();
+    if(n-lastMoveSave<850)return;
+    lastMoveSave=n;
+    postJson("/api/move-item/"+item.id,{x:item.x,y:item.y,w:item.w,h:item.h,z:item.z});
 }
-
 function bindDragging(){
-    document.querySelectorAll(".item.editable").forEach(el => {
-        if(el.dataset.bound === "1") return;
-        el.dataset.bound = "1";
-
-        let dragging = false;
-        let sx = 0, sy = 0, ox = 0, oy = 0;
-
-        el.addEventListener("mousedown", e => {
-            if(e.button !== 0) return;
-            if(drawMode) return;
-            if(e.target.closest(".minibar,button,input,textarea,audio")) return;
-
-            const item = loaded.get(el.dataset.id);
-            if(!item) return;
-
-            dragging = true;
-            el.classList.add("dragging");
-            sx = e.clientX;
-            sy = e.clientY;
-            ox = item.x;
-            oy = item.y;
+    document.querySelectorAll(".item.editable").forEach(el=>{
+        if(el.dataset.bound==="1")return;
+        el.dataset.bound="1";
+        let drag=false, sx=0, sy=0, ox=0, oy=0;
+        el.addEventListener("mousedown",e=>{
+            if(e.button===2 || e.target.closest("button") || document.body.classList.contains("draw-mode"))return;
+            drag=true; sx=e.clientX; sy=e.clientY;
+            ox=parseInt(el.style.left||"0"); oy=parseInt(el.style.top||"0");
             e.preventDefault();
-            e.stopPropagation();
         });
-
-        document.addEventListener("mousemove", e => {
-            if(!dragging) return;
-            const item = loaded.get(el.dataset.id);
-            if(!item) return;
-
-            item.x = ox + (e.clientX - sx);
-            item.y = oy + (e.clientY - sy);
-            el.style.left = item.x + "px";
-            el.style.top = item.y + "px";
+        document.addEventListener("mousemove",e=>{
+            if(!drag)return;
+            const item=getItem(el.dataset.id); if(!item)return;
+            item.x=ox+((e.clientX-sx)/zoom);
+            item.y=oy+((e.clientY-sy)/zoom);
+            el.style.left=item.x+"px"; el.style.top=item.y+"px";
         });
-
-        document.addEventListener("mouseup", () => {
-            if(!dragging) return;
-            dragging = false;
-            el.classList.remove("dragging");
-
-            const item = loaded.get(el.dataset.id);
-            if(item) saveItemState(item, true);
+        document.addEventListener("mouseup",()=>{
+            if(!drag)return;
+            drag=false;
+            const item=getItem(el.dataset.id); if(item) savePos(item);
         });
     });
 }
 
-function toggleDraw(){
-    setActiveTool("draw");
-    drawMode = !drawMode;
-    document.body.classList.toggle("draw-on", drawMode);
-    const p = document.getElementById("palette");
-    if(p) p.classList.toggle("show", drawMode);
-}
+// drawing
+let drawMode=false, drawing=false, points=[];
+let selectedDrawColor = "#111111";
+let selectedDrawSize = 4;
+const canvas=document.getElementById("drawCanvas");
+const ctx=canvas ? canvas.getContext("2d") : null;
 
-function selectColor(color, el){
-    selectedColor = color;
-    document.querySelectorAll(".dot").forEach(d => d.classList.remove("active"));
-    if(el) el.classList.add("active");
-    if(draft){
-        const ta = draft.querySelector("textarea");
-        if(ta) ta.style.color = selectedColor;
-    }
-}
-
-function resizeCanvas(){
+function resizeDrawCanvas(){
     if(!canvas) return;
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
 }
-resizeCanvas();
+resizeDrawCanvas();
+window.addEventListener("resize", resizeDrawCanvas);
 
-let drawing = false;
-let drawPoints = [];
+function isUiTarget(e){
+    return !!(e.target && e.target.closest(
+        "#tools,.panel,#settingsOverlay,#loginOverlay,.toolbar,button,input,textarea,select"
+    ));
+}
 
-function eventIsUi(e){
-    return !!(e.target && e.target.closest("#tools,#palette,#settingsOverlay,.minibar,.draft,button,input,textarea,audio"));
+function toggleDrawPalette(){
+    setActiveTool("draw");
+    const p = document.getElementById("panel-draw");
+    if(p) p.classList.toggle("show");
+    drawMode = true;
+    document.body.classList.add("draw-mode");
+}
+
+function selectDrawColor(color, el){
+    selectedDrawColor = color;
+    document.querySelectorAll(".color-dot").forEach(x=>x.classList.remove("active"));
+    if(el) el.classList.add("active");
+    if(draftInput){
+        draftInput.style.color = selectedDrawColor;
+    }
+    drawMode = true;
+    document.body.classList.add("draw-mode");
+}
+
+function drawPoint(e){
+    const p=screenToWorld(e.clientX,e.clientY);
+    return {x:e.clientX, y:e.clientY, realX:p.x, realY:p.y};
 }
 
 if(canvas && ctx){
-    canvas.addEventListener("mousedown", e => {
-        if(!drawMode || e.button !== 0) return;
-        if(eventIsUi(e)) return;
+    viewport.addEventListener("mousedown", e=>{
+        if(!drawMode) return;
+        if(e.button !== 0) return;
+        if(isUiTarget(e)) return;
 
-        drawing = true;
-        drawPoints = [];
+        drawing=true;
+        points=[];
 
-        const wp = screenToWorld(e.clientX, e.clientY);
-        drawPoints.push({x:wp.x, y:wp.y});
+        const p=drawPoint(e);
+        points.push({x:p.realX,y:p.realY});
 
         ctx.clearRect(0,0,canvas.width,canvas.height);
-        ctx.strokeStyle = selectedColor;
-        ctx.lineWidth = drawSize;
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
+        ctx.strokeStyle=selectedDrawColor || "#111";
+        ctx.lineWidth=selectedDrawSize;
+        ctx.lineCap="round";
+        ctx.lineJoin="round";
         ctx.beginPath();
-        ctx.moveTo(e.clientX, e.clientY);
+        ctx.moveTo(p.x,p.y);
 
         e.preventDefault();
     });
 
-    canvas.addEventListener("mousemove", e => {
+    document.addEventListener("mousemove", e=>{
         if(!drawMode || !drawing) return;
+        if(isUiTarget(e)) return;
 
-        const wp = screenToWorld(e.clientX, e.clientY);
-        const last = drawPoints[drawPoints.length - 1];
-        if(last && Math.abs(last.x - wp.x) + Math.abs(last.y - wp.y) < 4) return;
+        const p=drawPoint(e);
+        const last=points[points.length-1];
 
-        drawPoints.push({x:wp.x, y:wp.y});
-        ctx.lineTo(e.clientX, e.clientY);
+        if(last && Math.abs(last.x-p.realX)+Math.abs(last.y-p.realY)<4) return;
+
+        points.push({x:p.realX,y:p.realY});
+        ctx.lineTo(p.x,p.y);
         ctx.stroke();
 
         e.preventDefault();
-    });
+    }, {passive:false});
 
-    document.addEventListener("mouseup", () => {
+    document.addEventListener("mouseup",()=>{
         if(!drawMode || !drawing) return;
-        drawing = false;
 
+        drawing=false;
         ctx.clearRect(0,0,canvas.width,canvas.height);
 
-        if(drawPoints.length < 2) return;
+        if(points.length<2) return;
 
-        postJson("/api/add-drawing", {
-            points:drawPoints,
-            stroke:selectedColor,
-            stroke_width:drawSize
-        }).then(out => {
-            if(out && out.item){
-                addOrUpdateItem(out.item);
-                bindDragging();
-            }
-            loadViewport(true);
+        postJson("/api/add-drawing",{
+            points,
+            stroke:selectedDrawColor,
+            stroke_width:selectedDrawSize
+        }).then(out=>{
+            lastLoadKey="";
+            loadViewport();
         });
     });
 }
 
-applyCamera();
-if(LOGGED_IN){
-    loadViewport(true);
-    setInterval(() => loadViewport(true), 15000);
-}
 </script>
 </body>
 </html>
@@ -1385,12 +1491,8 @@ def html_page():
     user = current_user()
     user_obj = None
     if user:
-        user_obj = {
-            "id": user.get("id", ""),
-            "username": user.get("username", ""),
-            "email": user.get("email", ""),
-        }
-    return render_template_string(HTML, app_name=APP_NAME, user=user_obj)
+        user_obj = {"id": user.get("id", ""), "username": user.get("username", ""), "email": user.get("email", "")}
+    return render_template_string(HTML, user=user_obj)
 
 
 # -----------------------------
@@ -1402,23 +1504,16 @@ def home():
     return html_page()
 
 
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "app": APP_NAME})
-
-
 @app.route("/api/items")
-@login_required
 def api_items():
     user = current_user()
     x = clamp_int(request.args.get("x"), -10_000_000, 10_000_000, 0)
     y = clamp_int(request.args.get("y"), -10_000_000, 10_000_000, 0)
     w = clamp_int(request.args.get("w"), 100, 8000, 1600)
     h = clamp_int(request.args.get("h"), 100, 8000, 1000)
-
     try:
         db = load_store()["db"]
-        items = visible_items(db, user, x, y, x + w, y + h)
+        items = visible_items(db, user, x, y, x+w, y+h)
         return jsonify({"ok": True, "items": items, "updated_at": db.get("updated_at", 0)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "items": []}), 500
@@ -1446,9 +1541,7 @@ def register():
         return redirect(url_for("home"))
 
     try:
-        store = load_store(force=True)
-        db = store["db"]
-        old_snapshot_id = store.get("latest_snapshot_id", "")
+        db = load_store(force=True)["db"]
     except Exception as e:
         flash(str(e), "error")
         return redirect(url_for("home"))
@@ -1478,7 +1571,7 @@ def register():
     }
 
     try:
-        save_db(db, old_snapshot_id)
+        save_db(db)
     except Exception as e:
         flash(str(e), "error")
         return redirect(url_for("home"))
@@ -1504,10 +1597,7 @@ def login():
 
     found = None
     for user in db["users"].values():
-        if (
-            normalize_email(user.get("email")) == normalize_email(email_or_user)
-            or user.get("username", "").lower() == email_or_user.lower()
-        ):
+        if normalize_email(user.get("email")) == normalize_email(email_or_user) or user.get("username", "").lower() == email_or_user.lower():
             found = user
             break
 
@@ -1537,9 +1627,7 @@ def settings():
         return redirect(url_for("home"))
 
     try:
-        store = load_store(force=True)
-        db = store["db"]
-        old_snapshot_id = store.get("latest_snapshot_id", "")
+        db = load_store(force=True)["db"]
     except Exception as e:
         flash(str(e), "error")
         return redirect(url_for("home"))
@@ -1574,27 +1662,13 @@ def settings():
             item["updated"] = int(time.time())
 
     try:
-        save_db(db, old_snapshot_id)
+        save_db(db)
     except Exception as e:
         flash(str(e), "error")
         return redirect(url_for("home"))
 
     return redirect(url_for("home"))
 
-
-def get_item_for_edit(item_id):
-    store = load_store(force=True)
-    db = store["db"]
-    item = db["items"].get(item_id)
-
-    if not item:
-        return store, db, None, "not found"
-
-    user = current_user()
-    if not item_can_edit(item, user):
-        return store, db, None, "not yours"
-
-    return store, db, item, ""
 
 
 @app.route("/api/add-text-box", methods=["POST"])
@@ -1607,22 +1681,18 @@ def api_add_text_box():
     color = safe_hex_color(data.get("color"), "#111111")
     x = clamp_int(data.get("x"), -10_000_000, 10_000_000, 0)
     y = clamp_int(data.get("y"), -10_000_000, 10_000_000, 0)
-    w = clamp_int(data.get("w"), 80, 900, 360)
-    h = clamp_int(data.get("h"), 50, 500, 140)
+    w = clamp_int(data.get("w"), 80, MAX_TEXT_W, 260)
+    h = clamp_int(data.get("h"), 50, MAX_TEXT_H, 120)
 
     if not text:
         return jsonify({"ok": False, "error": "empty"}), 400
 
     try:
-        store = load_store(force=True)
-        db = store["db"]
-        old_snapshot_id = store.get("latest_snapshot_id", "")
-
+        db = load_store(force=True)["db"]
         ok, msg = item_limit_ok(db, user)
         if not ok:
             return jsonify({"ok": False, "error": msg}), 400
-
-        ok, msg = rate_limit_user(db, user, "text", 3)
+        ok, msg = rate_limit_user(db, user, "text", 8)
         if not ok:
             return jsonify({"ok": False, "error": msg}), 429
     except Exception as e:
@@ -1641,25 +1711,74 @@ def api_add_text_box():
         "z": int(time.time()) % 9000 + 1,
         "text": text,
         "color": color,
-        "font": 52,
+        "bg": "transparent",
+        "font": 58,
         "created": int(time.time()),
         "updated": int(time.time()),
     }
 
     try:
-        save_db(db, old_snapshot_id)
+        save_db(db)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
     return jsonify({"ok": True, "id": item_id, "item": public_item(db["items"][item_id], user)})
 
 
-def add_uploaded_file(kind):
+@app.route("/add-text", methods=["POST"])
+@login_required
+def add_text():
+    user = current_user()
+    text = clean_text(request.form.get("text"), MAX_TEXT_CHARS)
+    color = safe_hex_color(request.form.get("color"), "#111111")
+    bg = safe_hex_color(request.form.get("bg"), "#ffffff")
+    font = clamp_int(request.form.get("font"), 10, 36, 18)
+    x = clamp_int(request.form.get("x"), -10_000_000, 10_000_000, 0)
+    y = clamp_int(request.form.get("y"), -10_000_000, 10_000_000, 0)
+
+    if not text:
+        return redirect(url_for("home"))
+
+    try:
+        db = load_store(force=True)["db"]
+        ok, msg = item_limit_ok(db, user)
+        if not ok:
+            flash(msg, "error")
+            return redirect(url_for("home"))
+        ok, msg = rate_limit_user(db, user, "text", 8)
+        if not ok:
+            flash(msg, "error")
+            return redirect(url_for("home"))
+    except Exception as e:
+        flash(str(e), "error")
+        return redirect(url_for("home"))
+
+    item_id = secrets.token_hex(10)
+
+    db["items"][item_id] = {
+        "id": item_id, "type": "text", "user_id": user["id"], "username": user["username"],
+        "x": x, "y": y, "w": 260, "h": 150, "z": int(time.time()) % 9000 + 1,
+        "text": text, "color": color, "bg": bg, "font": font,
+        "created": int(time.time()), "updated": int(time.time()),
+    }
+
+    try:
+        save_db(db)
+    except Exception as e:
+        flash(str(e), "error")
+
+    return redirect(url_for("home"))
+
+
+def add_uploaded_file(kind, api=False):
     user = current_user()
     field = "image" if kind == "image" else "audio"
 
     def fail(message, status=400):
-        return jsonify({"ok": False, "error": message}), status
+        if api:
+            return jsonify({"ok": False, "error": message}), status
+        flash(message, "error")
+        return redirect(url_for("home"))
 
     if field not in request.files:
         return fail("no file selected")
@@ -1688,15 +1807,12 @@ def add_uploaded_file(kind):
     y = clamp_int(request.form.get("y"), -10_000_000, 10_000_000, 0)
 
     try:
-        store = load_store(force=True)
-        db = store["db"]
-        old_snapshot_id = store.get("latest_snapshot_id", "")
-
+        db = load_store(force=True)["db"]
         ok, msg = item_limit_ok(db, user)
         if not ok:
             return fail(msg)
 
-        ok, msg = rate_limit_user(db, user, "upload", 6)
+        ok, msg = rate_limit_user(db, user, "upload", 8 if api else 25)
         if not ok:
             return fail(msg, 429)
     except Exception as e:
@@ -1717,7 +1833,7 @@ def add_uploaded_file(kind):
     attachments = msg.get("attachments", []) or []
     attachment = attachments[0] if attachments else {}
 
-    w, h = (320, 240) if kind == "image" else (340, 86)
+    w, h = (300, 220) if kind == "image" else (320, 80)
 
     db["items"][item_id] = {
         "id": item_id,
@@ -1739,23 +1855,42 @@ def add_uploaded_file(kind):
     }
 
     try:
-        save_db(db, old_snapshot_id)
+        save_db(db)
     except Exception as e:
         return fail(str(e), 500)
 
-    return jsonify({"ok": True, "id": item_id, "item": public_item(db["items"][item_id], user)})
+    if api:
+        return jsonify({
+            "ok": True,
+            "id": item_id,
+            "item": public_item(db["items"][item_id], user),
+        })
+
+    return redirect(url_for("home"))
+
+
+@app.route("/add-image", methods=["POST"])
+@login_required
+def add_image():
+    return add_uploaded_file("image", api=False)
+
+
+@app.route("/add-audio", methods=["POST"])
+@login_required
+def add_audio():
+    return add_uploaded_file("audio", api=False)
 
 
 @app.route("/api/add-image", methods=["POST"])
 @login_required
 def api_add_image():
-    return add_uploaded_file("image")
+    return add_uploaded_file("image", api=True)
 
 
 @app.route("/api/add-audio", methods=["POST"])
 @login_required
 def api_add_audio():
-    return add_uploaded_file("audio")
+    return add_uploaded_file("audio", api=True)
 
 
 @app.route("/board-file/<item_id>")
@@ -1769,6 +1904,7 @@ def board_file(item_id):
     if not item or item.get("type") not in {"image", "audio"}:
         abort(404)
 
+    # Support both the new field names and older DB snapshots from previous versions.
     message_id = (
         item.get("file_message_id")
         or item.get("image_message_id")
@@ -1790,62 +1926,108 @@ def board_file(item_id):
         or ""
     )
 
-    info = attachment_info_from_message(message_id) if message_id else None
+    info = None
+    if message_id:
+        info = attachment_info_from_message(message_id)
 
-    urls = []
+    url = ""
+    content_type = ""
+
     if info:
-        urls.extend([info.get("url", ""), info.get("proxy_url", "")])
-    urls.extend([stored_url, stored_proxy_url])
-    urls = [u for u in urls if u]
+        url = info.get("url") or info.get("proxy_url") or ""
+        content_type = info.get("content_type") or ""
 
-    content_type = (
-        (info or {}).get("content_type")
-        or guess_content_type(item.get("filename", ""))
-    )
+    if not url:
+        url = stored_url or stored_proxy_url
 
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            final_type = r.headers.get("Content-Type") or content_type
-            return Response(
-                r.content,
-                mimetype=final_type,
-                headers={
-                    "Cache-Control": "public, max-age=600",
-                    "X-Content-Type-Options": "nosniff",
-                },
-            )
-        except Exception:
-            continue
+    if not content_type:
+        content_type = guess_content_type(item.get("filename", ""))
 
-    abort(404)
+    if not url:
+        abort(404)
+
+    # Proxy the file through this app instead of redirecting.
+    # This fixes cases where Discord's attachment URL/proxy URL does not render directly
+    # inside the whiteboard image/audio tag.
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+
+        final_type = r.headers.get("Content-Type") or content_type or guess_content_type(item.get("filename", ""))
+
+        return Response(
+            r.content,
+            mimetype=final_type,
+            headers={
+                "Cache-Control": "public, max-age=600",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception:
+        # Last fallback: try Discord proxy URL if the normal URL failed.
+        fallback = ""
+        if info:
+            fallback = info.get("proxy_url") or ""
+
+        if fallback and fallback != url:
+            try:
+                r = requests.get(fallback, timeout=60)
+                r.raise_for_status()
+
+                final_type = r.headers.get("Content-Type") or content_type or guess_content_type(item.get("filename", ""))
+
+                return Response(
+                    r.content,
+                    mimetype=final_type,
+                    headers={
+                        "Cache-Control": "public, max-age=600",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+            except Exception:
+                pass
+
+        abort(404)
+
+
+def get_item_for_edit(item_id):
+    store = load_store(force=True)
+    db = store["db"]
+    item = db["items"].get(item_id)
+
+    if not item:
+        return db, None, "not found"
+
+    user = current_user()
+    if not item_can_edit(item, user):
+        return db, None, "not yours"
+
+    return db, item, ""
 
 
 @app.route("/api/move-item/<item_id>", methods=["POST"])
 @login_required
 def api_move_item(item_id):
-    store, db, item, err = get_item_for_edit(item_id)
+    db, item, err = get_item_for_edit(item_id)
     if err:
         return jsonify({"ok": False, "error": err}), 403
 
     data = request.get_json(silent=True) or {}
     user = current_user()
-
     ok, msg = rate_limit_user(db, user, "move", 1)
     if not ok:
         return jsonify({"ok": False, "error": msg}), 429
 
     item["x"] = clamp_int(data.get("x"), -10_000_000, 10_000_000, int(item.get("x", 0)))
     item["y"] = clamp_int(data.get("y"), -10_000_000, 10_000_000, int(item.get("y", 0)))
-    item["w"] = clamp_int(data.get("w"), 50, 1000, int(item.get("w", 220)))
-    item["h"] = clamp_int(data.get("h"), 45, 800, int(item.get("h", 140)))
+    item["w"] = clamp_int(data.get("w"), 50, 900, int(item.get("w", 220)))
+    item["h"] = clamp_int(data.get("h"), 45, 700, int(item.get("h", 140)))
     item["z"] = clamp_int(data.get("z"), 1, 9999, int(item.get("z", 1)))
     item["updated"] = int(time.time())
     db["items"][item_id] = item
 
     try:
-        save_db(db, store.get("latest_snapshot_id", ""))
+        save_db(db)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -1855,7 +2037,7 @@ def api_move_item(item_id):
 @app.route("/api/edit-text/<item_id>", methods=["POST"])
 @login_required
 def api_edit_text(item_id):
-    store, db, item, err = get_item_for_edit(item_id)
+    db, item, err = get_item_for_edit(item_id)
     if err:
         return jsonify({"ok": False, "error": err}), 403
 
@@ -1863,13 +2045,13 @@ def api_edit_text(item_id):
         return jsonify({"ok": False, "error": "not text"}), 400
 
     data = request.get_json(silent=True) or {}
-    text = clean_text(data.get("text"), MAX_TEXT_CHARS)
+    text = clean_text(data.get("text"), 800)
 
     if not text:
         return jsonify({"ok": False, "error": "empty"}), 400
 
     user = current_user()
-    ok, msg = rate_limit_user(db, user, "edit", 3)
+    ok, msg = rate_limit_user(db, user, "edit", 5)
     if not ok:
         return jsonify({"ok": False, "error": msg}), 429
 
@@ -1878,7 +2060,7 @@ def api_edit_text(item_id):
     db["items"][item_id] = item
 
     try:
-        save_db(db, store.get("latest_snapshot_id", ""))
+        save_db(db)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -1888,19 +2070,19 @@ def api_edit_text(item_id):
 @app.route("/api/delete-item/<item_id>", methods=["POST"])
 @login_required
 def api_delete_item(item_id):
-    store, db, item, err = get_item_for_edit(item_id)
+    db, item, err = get_item_for_edit(item_id)
     if err:
         return jsonify({"ok": False, "error": err}), 403
 
     user = current_user()
-    ok, msg = rate_limit_user(db, user, "delete", 2)
+    ok, msg = rate_limit_user(db, user, "delete", 3)
     if not ok:
         return jsonify({"ok": False, "error": msg}), 429
 
     db["items"].pop(item_id, None)
 
     try:
-        save_db(db, store.get("latest_snapshot_id", ""))
+        save_db(db)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -1917,8 +2099,9 @@ def api_add_drawing():
     if not isinstance(points, list) or len(points) < 2:
         return jsonify({"ok": False, "error": "empty"}), 400
 
+    points = points[:MAX_DRAW_POINTS]
     clean_points = []
-    for p in points[:MAX_DRAW_POINTS]:
+    for p in points:
         if not isinstance(p, dict):
             continue
         x = clamp_int(p.get("x"), -10_000_000, 10_000_000, 0)
@@ -1929,15 +2112,11 @@ def api_add_drawing():
         return jsonify({"ok": False, "error": "empty"}), 400
 
     try:
-        store = load_store(force=True)
-        db = store["db"]
-        old_snapshot_id = store.get("latest_snapshot_id", "")
-
+        db = load_store(force=True)["db"]
         ok, msg = item_limit_ok(db, user)
         if not ok:
             return jsonify({"ok": False, "error": msg}), 400
-
-        ok, msg = rate_limit_user(db, user, "draw", 3)
+        ok, msg = rate_limit_user(db, user, "draw", 12)
         if not ok:
             return jsonify({"ok": False, "error": msg}), 429
     except Exception as e:
@@ -1947,35 +2126,61 @@ def api_add_drawing():
     min_y = min(p["y"] for p in clean_points) - 20
     max_x = max(p["x"] for p in clean_points) + 20
     max_y = max(p["y"] for p in clean_points) + 20
-
     w = max(60, max_x - min_x)
     h = max(60, max_y - min_y)
-    rel_points = [{"x": p["x"] - min_x, "y": p["y"] - min_y} for p in clean_points]
 
+    rel_points = [{"x": p["x"] - min_x, "y": p["y"] - min_y} for p in clean_points]
     item_id = secrets.token_hex(10)
+
     db["items"][item_id] = {
-        "id": item_id,
-        "type": "drawing",
-        "user_id": user["id"],
-        "username": user["username"],
-        "x": min_x,
-        "y": min_y,
-        "w": w,
-        "h": h,
-        "z": int(time.time()) % 9000 + 1,
+        "id": item_id, "type": "drawing", "user_id": user["id"], "username": user["username"],
+        "x": min_x, "y": min_y, "w": w, "h": h, "z": int(time.time()) % 9000 + 1,
         "points": rel_points,
         "stroke": safe_hex_color(data.get("stroke"), "#111111"),
         "stroke_width": clamp_int(data.get("stroke_width"), 1, 30, 4),
-        "created": int(time.time()),
-        "updated": int(time.time()),
+        "created": int(time.time()), "updated": int(time.time()),
     }
 
     try:
-        save_db(db, old_snapshot_id)
+        save_db(db)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    return jsonify({"ok": True, "id": item_id, "item": public_item(db["items"][item_id], user)})
+    return jsonify({"ok": True})
+
+
+
+@app.route("/api/debug-item/<item_id>")
+@login_required
+def api_debug_item(item_id):
+    if not current_is_staff():
+        return jsonify({"ok": False, "error": "no"}), 403
+
+    try:
+        db = load_store(force=True)["db"]
+        item = db.get("items", {}).get(item_id)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    if not item:
+        return jsonify({"ok": False, "error": "not found"}), 404
+
+    return jsonify({
+        "ok": True,
+        "item": {
+            "id": item.get("id"),
+            "type": item.get("type"),
+            "filename": item.get("filename"),
+            "file_message_id": item.get("file_message_id"),
+            "image_message_id": item.get("image_message_id"),
+            "file_url_exists": bool(item.get("file_url")),
+            "image_url_exists": bool(item.get("image_url")),
+            "x": item.get("x"),
+            "y": item.get("y"),
+            "w": item.get("w"),
+            "h": item.get("h"),
+        }
+    })
 
 
 @app.route("/cleanup")
@@ -1983,40 +2188,18 @@ def api_add_drawing():
 def cleanup_route():
     if not current_is_staff():
         return "no", 403
-
-    try:
-        messages = fetch_messages(max_pages=10, stop_after_snapshot=False)
-        snapshots = [
-            m
-            for m in messages
-            if (m.get("content", "") or "").startswith("WBDBSNAP|")
-        ]
-        snapshots.sort(key=lambda m: int(m.get("id", "0")), reverse=True)
-
-        deleted = 0
-        for msg in snapshots[1:101]:
-            if delete_message(msg.get("id", "")):
-                deleted += 1
-                time.sleep(0.18)
-
-        clear_cache()
-        return f"deleted {deleted}"
-    except Exception as e:
-        return str(e), 500
+    result = cleanup_old_snapshots(keep=DB_SNAPSHOT_KEEP, delete_limit=100, max_pages=12)
+    return f"deleted {result.get('deleted', 0)}"
 
 
 @app.errorhandler(413)
 def too_large(error):
-    if request.path.startswith("/api/"):
-        return jsonify({"ok": False, "error": "too large"}), 413
     flash("too large", "error")
     return redirect(request.referrer or url_for("home"))
 
 
 @app.errorhandler(404)
 def not_found(error):
-    if request.path.startswith("/api/"):
-        return jsonify({"ok": False, "error": "not found"}), 404
     return redirect(url_for("home"))
 
 
